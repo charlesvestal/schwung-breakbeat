@@ -2,7 +2,7 @@
   "id": "breakbeat",
   "name": "Breakbeat",
   "abbrev": "BB",
-  "version": "0.3.3",
+  "version": "0.3.18",
   "description": "Breakbeat generator with algorithmic retriggering",
   "author": "mestela",
   "license": "MIT",
@@ -41,7 +41,12 @@
               "label": "A Length",
               "type": "enum",
               "options": [
-                "1/4 bar", "1/2 bar", "1 bar", "2 bars", "4 bars", "8 bars"
+                "1/4 bar",
+                "1/2 bar",
+                "1 bar",
+                "2 bars",
+                "4 bars",
+                "8 bars"
               ],
               "default": 2
             },
@@ -58,7 +63,12 @@
               "label": "B Length",
               "type": "enum",
               "options": [
-                "1/4 bar", "1/2 bar", "1 bar", "2 bars", "4 bars", "8 bars"
+                "1/4 bar",
+                "1/2 bar",
+                "1 bar",
+                "2 bars",
+                "4 bars",
+                "8 bars"
               ],
               "default": 2
             },
@@ -82,7 +92,13 @@
               "key": "phrase",
               "label": "Phrase",
               "type": "enum",
-              "options": ["Off", "2 bars", "4 bars", "8 bars", "16 bars"],
+              "options": [
+                "Off",
+                "2 bars",
+                "4 bars",
+                "8 bars",
+                "16 bars"
+              ],
               "default": 0
             },
             {
@@ -121,7 +137,13 @@
               "key": "retrigger_rate",
               "label": "Retrig Rate",
               "type": "enum",
-              "options": ["2x", "3x", "4x", "8x", "Rand"],
+              "options": [
+                "2x",
+                "3x",
+                "4x",
+                "8x",
+                "Rand"
+              ],
               "default": 0
             },
             {
@@ -136,7 +158,9 @@
               "key": "status",
               "label": "Status",
               "type": "enum",
-              "options": ["-"],
+              "options": [
+                "-"
+              ],
               "default": 0
             }
           ],

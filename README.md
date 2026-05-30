@@ -8,6 +8,8 @@ driven dance music: classic breaks (Amen, Funky Drummer, Think, Apache, etc.)
 keep their kick-snare backbone via the **Anchor** knob, while **Roll**, **Fill**,
 and **Phrase** add motion, fills, and multi-bar phrasing.
 
+Demo: https://www.youtube.com/watch?v=vYf1vPt3pMc
+
 ## Before you start... fix midi out
 This uses midi out to get timing from the Move side of things. I'l see if there's a more elegant way to do this, but for now:
 

@@ -19,24 +19,25 @@
 #define BB_PAD_BASE        36   /* note of row 0, col 0 */
 #define BB_PAD_ROW_STRIDE  8    /* notes per row */
 
-/* Macro columns (row 3). */
+/* Macro indices (row 3+). Stutter 4×/8× are separate pads (velocity-independent),
+ * so the macro set is 9 wide and spills one note past the 8-wide row — fine,
+ * these are just MIDI notes. */
 #define BB_MACRO_AB_SWAP   0
 #define BB_MACRO_REVERSE   1
 #define BB_MACRO_RANDOMIZE 2
 #define BB_MACRO_FREEZE    3
 #define BB_MACRO_HALF      4
 #define BB_MACRO_DOUBLE    5
-#define BB_MACRO_STUTTER   6
-#define BB_MACRO_RESEED    7
-
-/* Velocity at/above which the stutter macro selects 8× instead of 4×. */
-#define BB_STUTTER_VEL_HI  100
+#define BB_MACRO_STUTTER4  6
+#define BB_MACRO_STUTTER8  7
+#define BB_MACRO_RESEED    8
+#define BB_MACRO_COUNT     9
 
 typedef enum {
     BB_PAD_NONE = 0,
-    BB_PAD_A_SLICE,   /* index = slice 0..7 (rows 0 and 1)            */
-    BB_PAD_B_SLICE,   /* index = slice 0..7 (row 2; Phase 1 = A bank) */
-    BB_PAD_MACRO      /* index = macro 0..7 (row 3)                   */
+    BB_PAD_A_SLICE,   /* index = slice 0..7 (notes 36-43 and 44-51)         */
+    BB_PAD_B_SLICE,   /* index = slice 0..7 (notes 52-59; Phase 1 = A bank) */
+    BB_PAD_MACRO      /* index = macro 0..8 (notes 60-68)                   */
 } bb_pad_kind_t;
 
 typedef struct {
@@ -65,7 +66,9 @@ typedef struct {
     int   double_held;     /* macro DOUBLE held                  */
     float rate_mult;       /* product of ½×/2× holds; 1.0 = none */
 
-    int   stutter_div;     /* 0 = off, else 4 or 8 (macro STUTTER) */
+    int   stutter4;        /* macro STUTTER4 held */
+    int   stutter8;        /* macro STUTTER8 held */
+    int   stutter_div;     /* effective division: 0 = off, else 8 (8× wins) or 4 */
 
     int   reseed_request;  /* one-shot: set on RESEED press, cleared by host */
 } bb_perf_t;
@@ -87,7 +90,7 @@ void bb_perf_slice_release(bb_perf_t *p, int slice);
 /* Top of the held-slice stack, or -1 if none held. */
 int bb_perf_top_slice(const bb_perf_t *p);
 
-/* Engage a macro on note-on. velocity selects 4×/8× for STUTTER. */
+/* Engage a macro on note-on. velocity is unused (kept for call-site symmetry). */
 void bb_perf_macro_on(bb_perf_t *p, int macro, int velocity);
 
 /* Release a macro on note-off. */

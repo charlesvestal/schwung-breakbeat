@@ -73,9 +73,9 @@ generative engine seamlessly resumes on the next tick.
 | **36–43** | C1–G1 | 0 (base) | A-slice 0–7 — play a slice of sample A (momentary) |
 | **44–51** | G#1–D#2 | 1 | A-slice 0–7 — same as row 0 (kept for muscle memory) |
 | **52–59** | E2–B2 | 2 | B-slice 0–7 — *Phase 1: plays from the A buffer* |
-| **60–67** | C3–G3 | 3 | Macros (see below) |
+| **60–68** | C3–G#3 | 3+ | Macros (see below) |
 
-#### Slice pads (rows 0–2)
+#### Slice pads
 
 | Note | Name | Slice |
 |---|---|---|
@@ -95,7 +95,7 @@ releasing it falls back to whatever slice is still held, then to the engine.
 Every press is momentary — a slice can only be held once, so a single note-off
 always fully releases it (no stuck notes).
 
-#### Macro pads (row 3)
+#### Macro pads
 
 | Note | Name | Macro | While held |
 |---|---|---|---|
@@ -105,12 +105,14 @@ always fully releases it (no stuck notes).
 | **63** | D#3 | Freeze | Latch the current slice and keep re-triggering it |
 | **64** | E3 | ½× (half speed) | Slice plays an octave down **and** half as fast (re-triggers every other beat) |
 | **65** | F3 | 2× (double speed) | Slice plays an octave up and twice as fast (re-triggers within the beat) |
-| **66** | F#3 | Stutter | Forces a sub-slice retrigger — 4× normally, 8× at velocity ≥ 100 |
-| **67** | G3 | Reseed | One-shot: re-rolls the RNG and forces an immediate new slice pick |
+| **66** | F#3 | Stutter 4× | Forces a 4× sub-slice retrigger |
+| **67** | G3 | Stutter 8× | Forces an 8× sub-slice retrigger |
+| **68** | G#3 | Reseed | One-shot: re-rolls the RNG and forces an immediate new slice pick |
 
 All macros are momentary and stack. ½× and 2× held together cancel to 1×.
-Reverse combines with any speed. Stutter layers on top of everything. A held
-slice pad always wins over Randomize and Freeze (explicit beats automatic).
+Reverse combines with any speed. Stutter layers on top of everything; holding
+both Stutter pads gives 8× (the faster wins). A held slice pad always wins over
+Randomize and Freeze (explicit beats automatic).
 
 > **A/B swap (note 60) is not functional yet.** It sets a flag but the engine
 > ignores it in Phase 1, because only one sample buffer is resident. It becomes
@@ -215,6 +217,7 @@ ssh-keygen -R move.local
 ## Changelog
 
 ### v0.4.x — Live performance layer
+- **Stutter split into two pads.** Stutter is now two separate momentary notes — 4× (note 66) and 8× (note 67) — instead of one velocity-sensitive pad. Holding both gives 8×. Reseed moves to note 68.
 - **Momentary MIDI-pad performance system.** Slice pads (notes 36–59) and macro
   pads (60–67) override the generative engine while held; release to resume. See
   the [MIDI map](#midi-map) above.

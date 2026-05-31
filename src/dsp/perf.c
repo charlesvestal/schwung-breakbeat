@@ -12,22 +12,21 @@ void bb_perf_init(bb_perf_t *p) {
     p->half_held      = 0;
     p->double_held    = 0;
     p->rate_mult      = 1.0f;
+    p->stutter4       = 0;
+    p->stutter8       = 0;
     p->stutter_div    = 0;
     p->reseed_request = 0;
 }
 
 bb_pad_t bb_perf_decode(int note) {
     bb_pad_t r = { BB_PAD_NONE, -1 };
-    int rel = note - BB_PAD_BASE;
-    if (rel < 0 || rel >= 4 * BB_PAD_ROW_STRIDE) return r;
-    int row = rel / BB_PAD_ROW_STRIDE;
-    int col = rel % BB_PAD_ROW_STRIDE;
-    switch (row) {
-        case 0: /* live play — A slices, kept for backward compat */
-        case 1: r.kind = BB_PAD_A_SLICE; r.index = col; break;
-        case 2: r.kind = BB_PAD_B_SLICE; r.index = col; break;
-        case 3: r.kind = BB_PAD_MACRO;   r.index = col; break;
-        default: break;
+    /* Slices: notes 36-43 and 44-51 → A slice 0-7; 52-59 → B slice 0-7. */
+    if (note >= 36 && note <= 43) { r.kind = BB_PAD_A_SLICE; r.index = note - 36; return r; }
+    if (note >= 44 && note <= 51) { r.kind = BB_PAD_A_SLICE; r.index = note - 44; return r; }
+    if (note >= 52 && note <= 59) { r.kind = BB_PAD_B_SLICE; r.index = note - 52; return r; }
+    /* Macros: notes 60..(60+BB_MACRO_COUNT-1). */
+    if (note >= 60 && note < 60 + BB_MACRO_COUNT) {
+        r.kind = BB_PAD_MACRO; r.index = note - 60; return r;
     }
     return r;
 }
@@ -76,14 +75,20 @@ void bb_perf_macro_on(bb_perf_t *p, int macro, int velocity) {
         case BB_MACRO_DOUBLE:
             if (!p->double_held) { p->double_held = 1; p->rate_mult *= 2.0f; }
             break;
-        case BB_MACRO_STUTTER:
-            p->stutter_div = (velocity >= BB_STUTTER_VEL_HI) ? 8 : 4;
+        case BB_MACRO_STUTTER4:
+            p->stutter4 = 1;
+            p->stutter_div = p->stutter8 ? 8 : 4;
+            break;
+        case BB_MACRO_STUTTER8:
+            p->stutter8 = 1;
+            p->stutter_div = 8;   /* 8× wins when both held */
             break;
         case BB_MACRO_RESEED:
             p->reseed_request = 1;
             break;
         default: break;
     }
+    (void)velocity;
 }
 
 void bb_perf_macro_off(bb_perf_t *p, int macro) {
@@ -99,8 +104,13 @@ void bb_perf_macro_off(bb_perf_t *p, int macro) {
         case BB_MACRO_DOUBLE:
             if (p->double_held) { p->double_held = 0; p->rate_mult *= 0.5f; }
             break;
-        case BB_MACRO_STUTTER:
-            p->stutter_div = 0;
+        case BB_MACRO_STUTTER4:
+            p->stutter4 = 0;
+            p->stutter_div = p->stutter8 ? 8 : 0;
+            break;
+        case BB_MACRO_STUTTER8:
+            p->stutter8 = 0;
+            p->stutter_div = p->stutter4 ? 4 : 0;
             break;
         case BB_MACRO_RESEED:    /* one-shot; nothing to release */ break;
         default: break;

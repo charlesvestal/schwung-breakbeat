@@ -2,7 +2,7 @@
   "id": "breakbeat",
   "name": "Breakbeat",
   "abbrev": "BB",
-  "version": "0.4.11",
+  "version": "0.4.12",
   "description": "Breakbeat generator with algorithmic retriggering",
   "author": "mestela",
   "license": "MIT",

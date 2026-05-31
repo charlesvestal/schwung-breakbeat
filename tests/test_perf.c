@@ -47,19 +47,19 @@ int main(void) {
         ASSERT_EQ(p.index, n - 52, "row2 index");
     }
 
-    /* === decode: row 3 (60-67) → macros 0-7 === */
-    for (int n = 60; n <= 67; n++) {
+    /* === decode: macros (60-68) → macros 0-8 === */
+    for (int n = 60; n <= 68; n++) {
         bb_pad_t p = bb_perf_decode(n);
-        ASSERT_EQ(p.kind, BB_PAD_MACRO, "row3 is macro");
-        ASSERT_EQ(p.index, n - 60, "row3 index");
+        ASSERT_EQ(p.kind, BB_PAD_MACRO, "60-68 is macro");
+        ASSERT_EQ(p.index, n - 60, "macro index");
     }
 
     /* === decode: out of range → NONE === */
     {
         bb_pad_t lo = bb_perf_decode(35);
-        bb_pad_t hi = bb_perf_decode(68);
+        bb_pad_t hi = bb_perf_decode(69);
         ASSERT_EQ(lo.kind, BB_PAD_NONE, "note 35 is none");
-        ASSERT_EQ(hi.kind, BB_PAD_NONE, "note 68 is none");
+        ASSERT_EQ(hi.kind, BB_PAD_NONE, "note 69 is none");
     }
 
     /* === init: everything inert === */
@@ -171,15 +171,29 @@ int main(void) {
         ASSERT_NEAR(p.rate_mult, 1.0f, "release returns to 1.0");
     }
 
-    /* === macro: stutter division from velocity === */
+    /* === macro: stutter 4× and 8× are separate pads (no velocity) === */
     {
         bb_perf_t p; bb_perf_init(&p);
-        bb_perf_macro_on(&p, BB_MACRO_STUTTER, 64);
-        ASSERT_EQ(p.stutter_div, 4, "low velocity → 4×");
-        bb_perf_macro_off(&p, BB_MACRO_STUTTER);
-        ASSERT_EQ(p.stutter_div, 0, "release → off");
-        bb_perf_macro_on(&p, BB_MACRO_STUTTER, 120);
-        ASSERT_EQ(p.stutter_div, 8, "high velocity → 8×");
+        bb_perf_macro_on(&p, BB_MACRO_STUTTER4, 1);
+        ASSERT_EQ(p.stutter_div, 4, "stutter4 → 4×");
+        bb_perf_macro_off(&p, BB_MACRO_STUTTER4);
+        ASSERT_EQ(p.stutter_div, 0, "release stutter4 → off");
+        bb_perf_macro_on(&p, BB_MACRO_STUTTER8, 1);
+        ASSERT_EQ(p.stutter_div, 8, "stutter8 → 8×");
+        bb_perf_macro_off(&p, BB_MACRO_STUTTER8);
+        ASSERT_EQ(p.stutter_div, 0, "release stutter8 → off");
+    }
+
+    /* === macro: both stutters held → 8× wins; releasing 8× falls back to 4× === */
+    {
+        bb_perf_t p; bb_perf_init(&p);
+        bb_perf_macro_on(&p, BB_MACRO_STUTTER4, 1);
+        bb_perf_macro_on(&p, BB_MACRO_STUTTER8, 1);
+        ASSERT_EQ(p.stutter_div, 8, "both held → 8× wins");
+        bb_perf_macro_off(&p, BB_MACRO_STUTTER8);
+        ASSERT_EQ(p.stutter_div, 4, "release 8× → back to 4×");
+        bb_perf_macro_off(&p, BB_MACRO_STUTTER4);
+        ASSERT_EQ(p.stutter_div, 0, "release 4× → off");
     }
 
     /* === macro: reverse/randomize/freeze flag set & clear === */
@@ -267,10 +281,10 @@ int main(void) {
     /* === status_str: stutter shows division === */
     {
         bb_perf_t p; bb_perf_init(&p);
-        bb_perf_macro_on(&p, BB_MACRO_STUTTER, 120);   /* 8x */
+        bb_perf_macro_on(&p, BB_MACRO_STUTTER8, 1);
         char buf[32];
         bb_perf_status_str(&p, 0, 'A', buf, sizeof(buf));
-        ASSERT_TRUE(strcmp(buf, "A:1 ST8") == 0, "stutter → 'A:1 ST8'");
+        ASSERT_TRUE(strcmp(buf, "A:1 ST8") == 0, "stutter8 → 'A:1 ST8'");
     }
 
     /* === status_str: token order is stable (.5x/2x, REV, FRZ, RND, ST, A/B) === */

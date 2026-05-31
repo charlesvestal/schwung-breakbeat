@@ -2,7 +2,7 @@
   "id": "breakbeat",
   "name": "Breakbeat",
   "abbrev": "BB",
-  "version": "0.3.22",
+  "version": "0.3.24",
   "description": "Breakbeat generator with algorithmic retriggering",
   "author": "mestela",
   "license": "MIT",
@@ -126,24 +126,35 @@
               "default": 0
             },
             {
-              "key": "retrigger",
-              "label": "Retrigger",
+              "key": "retrig_2x",
+              "label": "Retrig 2x",
               "type": "int",
               "min": 0,
               "max": 100,
               "default": 0
             },
             {
-              "key": "retrigger_rate",
-              "label": "Retrig Rate",
-              "type": "enum",
-              "options": [
-                "2x",
-                "3x",
-                "4x",
-                "8x",
-                "Rand"
-              ],
+              "key": "retrig_3x",
+              "label": "Retrig 3x",
+              "type": "int",
+              "min": 0,
+              "max": 100,
+              "default": 0
+            },
+            {
+              "key": "retrig_4x",
+              "label": "Retrig 4x",
+              "type": "int",
+              "min": 0,
+              "max": 100,
+              "default": 0
+            },
+            {
+              "key": "retrig_8x",
+              "label": "Retrig 8x",
+              "type": "int",
+              "min": 0,
+              "max": 100,
               "default": 0
             },
             {
@@ -176,8 +187,10 @@
             "anchor",
             "roll",
             "fill",
-            "retrigger",
-            "retrigger_rate",
+            "retrig_2x",
+            "retrig_3x",
+            "retrig_4x",
+            "retrig_8x",
             "save_preset",
             "status"
           ]

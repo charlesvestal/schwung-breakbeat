@@ -50,11 +50,11 @@ typedef struct {
     uint32_t slice_starts[8];
     uint32_t slice_lengths[8];
     int current_slice;
-    float retrigger_prob;
+    float retrig_p[4];        /* [0]=2x [1]=3x [2]=4x [3]=8x, each 0..1 */
     int sub_slice_active;
     int sub_slice_counter;
     int retrigger_divisions;
-    int retrigger_rate_idx;
+    int preview_frames;       /* >0 = play preview even while transport stopped */
 
     uint64_t sample_counter;
 
@@ -286,14 +286,84 @@ static void resolve_sample_path(const char *module_dir, const char *path, char *
     }
 }
 
+#define BB_PORTAL_DIR      "/data/UserData/breakbeat-samples"
+#define BB_USER_LIB_TARGET "/data/UserData/UserLibrary/Samples"
+#define BB_BUILTIN_LINK    BB_PORTAL_DIR "/Built-in"
+#define BB_USER_LIB_LINK   BB_PORTAL_DIR "/User Library"
+
+/* Returns the directory part of a sample path, or BB_PORTAL_DIR as fallback. */
+static void sample_dirname(const char *path, char *dir, size_t dir_len) {
+    const char *slash = (path && path[0]) ? strrchr(path, '/') : NULL;
+    if (!slash || slash == path) { snprintf(dir, dir_len, "%s", BB_PORTAL_DIR); return; }
+    size_t n = (size_t)(slash - path);
+    if (n >= dir_len) n = dir_len - 1;
+    memcpy(dir, path, n);
+    dir[n] = '\0';
+}
+
+static void build_ui_hierarchy(const breakbeat_t *bb, char *out, int out_len) {
+    char ar[BB_PATH_MAX], br[BB_PATH_MAX];
+    sample_dirname(bb->main_sample_path, ar, sizeof(ar));
+    sample_dirname(bb->alt_sample_path,  br, sizeof(br));
+    snprintf(out, out_len,
+        "{\"modes\":null,\"levels\":{\"root\":{"
+        "\"list_param\":\"preset\",\"count_param\":\"preset_count\",\"name_param\":\"preset_name\","
+        "\"knobs\":[\"preset\",\"A_sample_path\",\"A_sample_length\",\"B_sample_path\",\"B_sample_length\","
+        "\"B_chance\",\"complexity\",\"phrase\",\"anchor\",\"roll\",\"fill\","
+        "\"retrig_2x\",\"retrig_3x\",\"retrig_4x\",\"retrig_8x\",\"save_preset\",\"status\"],"
+        "\"params\":["
+        "{\"key\":\"preset\",\"label\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":10},"
+        "{\"key\":\"A_sample_path\",\"label\":\"A Sample\",\"type\":\"filepath\",\"root\":\"%s\",\"filter\":\".wav\"},"
+        "{\"key\":\"A_sample_length\",\"label\":\"A Length\",\"type\":\"enum\",\"options\":[\"1/4 bar\",\"1/2 bar\",\"1 bar\",\"2 bars\",\"4 bars\",\"8 bars\"]},"
+        "{\"key\":\"B_sample_path\",\"label\":\"B Sample\",\"type\":\"filepath\",\"root\":\"%s\",\"filter\":\".wav\"},"
+        "{\"key\":\"B_sample_length\",\"label\":\"B Length\",\"type\":\"enum\",\"options\":[\"1/4 bar\",\"1/2 bar\",\"1 bar\",\"2 bars\",\"4 bars\",\"8 bars\"]},"
+        "{\"key\":\"B_chance\",\"label\":\"B Chance\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"complexity\",\"label\":\"Complexity\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"phrase\",\"label\":\"Phrase\",\"type\":\"enum\",\"options\":[\"Off\",\"2 bars\",\"4 bars\",\"8 bars\",\"16 bars\"]},"
+        "{\"key\":\"anchor\",\"label\":\"Anchor\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"roll\",\"label\":\"Roll\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"fill\",\"label\":\"Fill\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"retrig_2x\",\"label\":\"Retrig 2x\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"retrig_3x\",\"label\":\"Retrig 3x\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"retrig_4x\",\"label\":\"Retrig 4x\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"retrig_8x\",\"label\":\"Retrig 8x\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"save_preset\",\"label\":\"Save Preset\",\"type\":\"int\",\"min\":0,\"max\":1},"
+        "{\"key\":\"status\",\"label\":\"Status\",\"type\":\"enum\",\"options\":[\"-\"]}"
+        "]}}}",
+        ar, br);
+}
+
+static void build_chain_params(const breakbeat_t *bb, char *out, int out_len) {
+    char ar[BB_PATH_MAX], br[BB_PATH_MAX];
+    sample_dirname(bb->main_sample_path, ar, sizeof(ar));
+    sample_dirname(bb->alt_sample_path,  br, sizeof(br));
+    snprintf(out, out_len,
+        "["
+        "{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":10},"
+        "{\"key\":\"A_sample_path\",\"name\":\"A Sample\",\"type\":\"filepath\",\"root\":\"%s\",\"filter\":\".wav\"},"
+        "{\"key\":\"A_sample_length\",\"name\":\"A Length\",\"type\":\"enum\",\"options\":[\"1/4 bar\",\"1/2 bar\",\"1 bar\",\"2 bars\",\"4 bars\",\"8 bars\"]},"
+        "{\"key\":\"B_sample_path\",\"name\":\"B Sample\",\"type\":\"filepath\",\"root\":\"%s\",\"filter\":\".wav\"},"
+        "{\"key\":\"B_sample_length\",\"name\":\"B Length\",\"type\":\"enum\",\"options\":[\"1/4 bar\",\"1/2 bar\",\"1 bar\",\"2 bars\",\"4 bars\",\"8 bars\"]},"
+        "{\"key\":\"B_chance\",\"name\":\"B Chance\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"complexity\",\"name\":\"Complexity\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"phrase\",\"name\":\"Phrase\",\"type\":\"enum\",\"options\":[\"Off\",\"2 bars\",\"4 bars\",\"8 bars\",\"16 bars\"]},"
+        "{\"key\":\"anchor\",\"name\":\"Anchor\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"roll\",\"name\":\"Roll\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"fill\",\"name\":\"Fill\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"retrig_2x\",\"name\":\"Retrig 2x\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"retrig_3x\",\"name\":\"Retrig 3x\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"retrig_4x\",\"name\":\"Retrig 4x\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"retrig_8x\",\"name\":\"Retrig 8x\",\"type\":\"int\",\"min\":0,\"max\":100},"
+        "{\"key\":\"save_preset\",\"name\":\"Save Preset\",\"type\":\"int\",\"min\":0,\"max\":1},"
+        "{\"key\":\"status\",\"name\":\"Status\",\"type\":\"enum\",\"options\":[\"-\"]}"
+        "]",
+        ar, br);
+}
+
 /* Create the filepath browser "portal" with symlinks to bundled samples and
  * to the user's sample library. Idempotent — safe to run on every instance
  * creation. Needed because Module Store installs unpack the tarball but
  * don't run install.sh, so the symlinks must be set up at runtime. */
-#define BB_PORTAL_DIR        "/data/UserData/breakbeat-samples"
-#define BB_USER_LIB_TARGET   "/data/UserData/UserLibrary/Samples"
-#define BB_BUILTIN_LINK      BB_PORTAL_DIR "/Built-in"
-#define BB_USER_LIB_LINK     BB_PORTAL_DIR "/User Library"
 
 static void ensure_portal_exists(const char *module_dir) {
     if (mkdir(BB_PORTAL_DIR, 0755) != 0 && errno != EEXIST) {
@@ -517,8 +587,6 @@ static void apply_preset_json(breakbeat_t *bb, const char *json) {
     if (json_get_float(json, "anchor",     &fval)) bb->anchor     = fval / 100.0f;
     if (json_get_float(json, "roll",       &fval)) bb->roll       = fval / 100.0f;
     if (json_get_float(json, "fill",       &fval)) bb->fill       = fval / 100.0f;
-    if (json_get_float(json, "retrigger",  &fval)) bb->retrigger_prob = fval / 100.0f;
-
     if (json_get_string(json, "phrase", str_val, sizeof(str_val))) {
         const char *phrases[] = {"Off", "2 bars", "4 bars", "8 bars", "16 bars"};
         static const int phrase_values[] = {0, 2, 4, 8, 16};
@@ -530,24 +598,29 @@ static void apply_preset_json(breakbeat_t *bb, const char *json) {
         if (ival >= 0 && ival < 5) bb->phrase_bars = phrase_values[ival];
     }
 
-    if (json_get_string(json, "retrigger_rate", str_val, sizeof(str_val))) {
-        const char *rates[] = {"2x", "3x", "4x", "8x", "Rand"};
-        for (int i = 0; i < 5; i++) {
-            if (strcmp(rates[i], str_val) == 0) {
-                bb->retrigger_rate_idx = i;
-                if      (i == 0) bb->retrigger_divisions = 2;
-                else if (i == 1) bb->retrigger_divisions = 3;
-                else if (i == 2) bb->retrigger_divisions = 4;
-                else if (i == 3) bb->retrigger_divisions = 8;
-                break;
+    /* Per-rate retrigger probabilities (new format). */
+    {
+        int has_new = 0;
+        if (json_get_float(json, "retrig_2x", &fval)) { bb->retrig_p[0] = fval / 100.0f; has_new = 1; }
+        if (json_get_float(json, "retrig_3x", &fval)) { bb->retrig_p[1] = fval / 100.0f; has_new = 1; }
+        if (json_get_float(json, "retrig_4x", &fval)) { bb->retrig_p[2] = fval / 100.0f; has_new = 1; }
+        if (json_get_float(json, "retrig_8x", &fval)) { bb->retrig_p[3] = fval / 100.0f; has_new = 1; }
+        /* Backward-compat: old retrigger + retrigger_rate → new per-rate. */
+        if (!has_new) {
+            float prob = 0.0f;
+            json_get_float(json, "retrigger", &prob);
+            prob /= 100.0f;
+            const char *rates[] = {"2x", "3x", "4x", "8x", "Rand"};
+            int rate_idx = 0;
+            if (json_get_string(json, "retrigger_rate", str_val, sizeof(str_val)))
+                for (int i = 0; i < 5; i++)
+                    if (strcmp(rates[i], str_val) == 0) { rate_idx = i; break; }
+            if (rate_idx < 4) {
+                bb->retrig_p[rate_idx] = prob;
+            } else {
+                for (int i = 0; i < 4; i++) bb->retrig_p[i] = prob;
             }
         }
-    } else if (json_get_int(json, "retrigger_rate", &ival)) {
-        bb->retrigger_rate_idx = ival;
-        if      (ival == 0) bb->retrigger_divisions = 2;
-        else if (ival == 1) bb->retrigger_divisions = 3;
-        else if (ival == 2) bb->retrigger_divisions = 4;
-        else if (ival == 3) bb->retrigger_divisions = 8;
     }
 
     if (json_get_int(json, "B_chance", &ival))
@@ -584,11 +657,11 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     if (!bb) return NULL;
 
     bb->preset_idx = 0;
-    bb->retrigger_prob = 0.0f;
+    bb->retrig_p[0] = bb->retrig_p[1] = bb->retrig_p[2] = bb->retrig_p[3] = 0.0f;
     bb->sub_slice_active = 0;
     bb->sub_slice_counter = 0;
     bb->retrigger_divisions = 2;
-    bb->retrigger_rate_idx = 0;
+    bb->preview_frames = 0;
     bb->length = 1.0f;
     bb->main_length = 1.0f;
     bb->alt_length = 1.0f;
@@ -665,6 +738,18 @@ static void bb_destroy_instance(void *instance) {
     close_file(bb);
     free(bb);
     if (g_host && g_host->log) g_host->log("breakbeat: instance destroyed");
+}
+
+static void bb_start_preview(breakbeat_t *bb) {
+    float bpm = (bb->stable_bpm > 20.0f) ? bb->stable_bpm : 120.0f;
+    float spb = ((float)MOVE_SAMPLE_RATE * 60.0f / bpm) * 4.0f;
+    bb->preview_frames = (int)(spb * bb->active_length);
+    bb->play_pos       = (float)bb->slice_starts[0];
+    bb->current_slice  = 0;
+    bb->trigger_phase  = 0.0f;
+    bb->bar_phase      = 0.0f;
+    bb->trigger_count  = 0;
+    bb->bar_counter    = 0;
 }
 
 static void bb_reset_transport(breakbeat_t *bb) {
@@ -806,6 +891,7 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         if (!is_running) {
             apply_sample_path(bb, bb->main_sample_path, bb->main_length);
             bb->pending_sample_path[0] = '\0';
+            bb_start_preview(bb);
         } else {
             snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
                      "%s", bb->main_sample_path);
@@ -823,6 +909,7 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         if (!is_running) {
             apply_sample_path(bb, bb->main_sample_path, bb->main_length);
             bb->pending_sample_path[0] = '\0';
+            bb_start_preview(bb);
         } else {
             snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
                      "%s", bb->main_sample_path);
@@ -885,21 +972,25 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         if (bb->fill < 0.0f) bb->fill = 0.0f;
         if (bb->fill > 1.0f) bb->fill = 1.0f;
     }
-    else if (strcmp(key, "retrigger") == 0) {
-        bb->retrigger_prob = atof(val) / 100.0f;
-        if (bb->retrigger_prob < 0.0f) bb->retrigger_prob = 0.0f;
-        if (bb->retrigger_prob > 1.0f) bb->retrigger_prob = 1.0f;
+    else if (strcmp(key, "retrig_2x") == 0) {
+        bb->retrig_p[0] = atof(val) / 100.0f;
+        if (bb->retrig_p[0] < 0.0f) bb->retrig_p[0] = 0.0f;
+        if (bb->retrig_p[0] > 1.0f) bb->retrig_p[0] = 1.0f;
     }
-    else if (strcmp(key, "retrigger_rate") == 0) {
-        int idx = atoi(val);
-        if (idx < 0) idx = 0;
-        if (idx > 4) idx = 4;
-        bb->retrigger_rate_idx = idx;
-        
-        if (idx == 0) bb->retrigger_divisions = 2;
-        else if (idx == 1) bb->retrigger_divisions = 3;
-        else if (idx == 2) bb->retrigger_divisions = 4;
-        else if (idx == 3) bb->retrigger_divisions = 8;
+    else if (strcmp(key, "retrig_3x") == 0) {
+        bb->retrig_p[1] = atof(val) / 100.0f;
+        if (bb->retrig_p[1] < 0.0f) bb->retrig_p[1] = 0.0f;
+        if (bb->retrig_p[1] > 1.0f) bb->retrig_p[1] = 1.0f;
+    }
+    else if (strcmp(key, "retrig_4x") == 0) {
+        bb->retrig_p[2] = atof(val) / 100.0f;
+        if (bb->retrig_p[2] < 0.0f) bb->retrig_p[2] = 0.0f;
+        if (bb->retrig_p[2] > 1.0f) bb->retrig_p[2] = 1.0f;
+    }
+    else if (strcmp(key, "retrig_8x") == 0) {
+        bb->retrig_p[3] = atof(val) / 100.0f;
+        if (bb->retrig_p[3] < 0.0f) bb->retrig_p[3] = 0.0f;
+        if (bb->retrig_p[3] > 1.0f) bb->retrig_p[3] = 1.0f;
     }
     else if (strcmp(key, "B_chance") == 0) {
         bb->swap_prob = atof(val) / 100.0f;
@@ -939,8 +1030,7 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
             if (f) {
                 const char *lengths[] = {"1/4 bar", "1/2 bar", "1 bar", "2 bars", "4 bars", "8 bars"};
                 const char *phrases[] = {"Off", "2 bars", "4 bars", "8 bars", "16 bars"};
-                const char *rates[] = {"2x", "3x", "4x", "8x", "Rand"};
-                
+
                 int alt_len_idx = 2;
                 if (bb->alt_length == 0.25f) alt_len_idx = 0;
                 else if (bb->alt_length == 0.5f) alt_len_idx = 1;
@@ -948,7 +1038,7 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
                 else if (bb->alt_length == 2.0f) alt_len_idx = 3;
                 else if (bb->alt_length == 4.0f) alt_len_idx = 4;
                 else if (bb->alt_length == 8.0f) alt_len_idx = 5;
-                
+
                 fprintf(f, "{\n");
                 fprintf(f, "  \"name\": \"Preset %d\",\n", n);
                 fprintf(f, "  \"A_sample_path\": \"%s\",\n", bb->main_sample_path);
@@ -961,8 +1051,10 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
                 fprintf(f, "  \"anchor\": %d,\n", (int)(bb->anchor * 100.0f));
                 fprintf(f, "  \"roll\": %d,\n", (int)(bb->roll * 100.0f));
                 fprintf(f, "  \"fill\": %d,\n", (int)(bb->fill * 100.0f));
-                fprintf(f, "  \"retrigger\": %d,\n", (int)(bb->retrigger_prob * 100.0f));
-                fprintf(f, "  \"retrigger_rate\": \"%s\"\n", rates[bb->retrigger_rate_idx]);
+                fprintf(f, "  \"retrig_2x\": %d,\n", (int)(bb->retrig_p[0] * 100.0f));
+                fprintf(f, "  \"retrig_3x\": %d,\n", (int)(bb->retrig_p[1] * 100.0f));
+                fprintf(f, "  \"retrig_4x\": %d,\n", (int)(bb->retrig_p[2] * 100.0f));
+                fprintf(f, "  \"retrig_8x\": %d\n",  (int)(bb->retrig_p[3] * 100.0f));
                 fprintf(f, "}\n");
                 fclose(f);
                 
@@ -1028,20 +1120,10 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
             if (bb->fill < 0.0f) bb->fill = 0.0f;
             if (bb->fill > 1.0f) bb->fill = 1.0f;
         }
-        if (json_get_int(val, "retrigger", &i)) {
-            bb->retrigger_prob = (float)i / 100.0f;
-            if (bb->retrigger_prob < 0.0f) bb->retrigger_prob = 0.0f;
-            if (bb->retrigger_prob > 1.0f) bb->retrigger_prob = 1.0f;
-        }
-        if (json_get_int(val, "retrigger_rate", &i)) {
-            if (i < 0) i = 0;
-            if (i > 4) i = 4;
-            bb->retrigger_rate_idx = i;
-            if      (i == 0) bb->retrigger_divisions = 2;
-            else if (i == 1) bb->retrigger_divisions = 3;
-            else if (i == 2) bb->retrigger_divisions = 4;
-            else if (i == 3) bb->retrigger_divisions = 8;
-        }
+        if (json_get_int(val, "retrig_2x", &i)) bb->retrig_p[0] = (float)i / 100.0f;
+        if (json_get_int(val, "retrig_3x", &i)) bb->retrig_p[1] = (float)i / 100.0f;
+        if (json_get_int(val, "retrig_4x", &i)) bb->retrig_p[2] = (float)i / 100.0f;
+        if (json_get_int(val, "retrig_8x", &i)) bb->retrig_p[3] = (float)i / 100.0f;
         if (json_get_int(val, "swap_prob", &i)) {
             bb->swap_prob = (float)i / 100.0f;
             if (bb->swap_prob < 0.0f) bb->swap_prob = 0.0f;
@@ -1076,30 +1158,12 @@ static int bb_get_param(void *instance, const char *key, char *buf, int buf_len)
     
 
     if (strcmp(key, "ui_hierarchy") == 0) {
-        const char *hierarchy = "{\"modes\":null,\"levels\":{\"root\":{\"list_param\":\"preset\",\"count_param\":\"preset_count\",\"name_param\":\"preset_name\",\"knobs\":[\"preset\",\"A_sample_path\",\"A_sample_length\",\"B_sample_path\",\"B_sample_length\",\"B_chance\",\"complexity\",\"phrase\",\"anchor\",\"roll\",\"fill\",\"retrigger\",\"retrigger_rate\",\"save_preset\",\"status\"],\"params\":[{\"key\":\"preset\",\"label\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":10},{\"key\":\"A_sample_path\",\"label\":\"A Sample\",\"type\":\"filepath\",\"root\":\"/data/UserData/breakbeat-samples\",\"filter\":\".wav\"},{\"key\":\"A_sample_length\",\"label\":\"A Length\",\"type\":\"enum\",\"options\":[\"1/4 bar\",\"1/2 bar\",\"1 bar\",\"2 bars\",\"4 bars\",\"8 bars\"]},{\"key\":\"B_sample_path\",\"label\":\"B Sample\",\"type\":\"filepath\",\"root\":\"/data/UserData/breakbeat-samples\",\"filter\":\".wav\"},{\"key\":\"B_sample_length\",\"label\":\"B Length\",\"type\":\"enum\",\"options\":[\"1/4 bar\",\"1/2 bar\",\"1 bar\",\"2 bars\",\"4 bars\",\"8 bars\"]},{\"key\":\"B_chance\",\"label\":\"B Chance\",\"type\":\"int\",\"min\":0,\"max\":100},{\"key\":\"complexity\",\"label\":\"Complexity\",\"type\":\"int\",\"min\":0,\"max\":100},{\"key\":\"phrase\",\"label\":\"Phrase\",\"type\":\"enum\",\"options\":[\"Off\",\"2 bars\",\"4 bars\",\"8 bars\",\"16 bars\"]},{\"key\":\"anchor\",\"label\":\"Anchor\",\"type\":\"int\",\"min\":0,\"max\":100},{\"key\":\"roll\",\"label\":\"Roll\",\"type\":\"int\",\"min\":0,\"max\":100},{\"key\":\"fill\",\"label\":\"Fill\",\"type\":\"int\",\"min\":0,\"max\":100},{\"key\":\"retrigger\",\"label\":\"Retrigger\",\"type\":\"int\",\"min\":0,\"max\":100},{\"key\":\"retrigger_rate\",\"label\":\"Retrig Rate\",\"type\":\"enum\",\"options\":[\"2x\",\"3x\",\"4x\",\"8x\",\"Rand\"]},{\"key\":\"save_preset\",\"label\":\"Save Preset\",\"type\":\"int\",\"min\":0,\"max\":1},{\"key\":\"status\",\"label\":\"Status\",\"type\":\"enum\",\"options\":[\"-\"]}]}}}";
-        strncpy(buf, hierarchy, buf_len);
-        return strlen(hierarchy);
+        build_ui_hierarchy(bb, buf, buf_len);
+        return (int)strlen(buf);
     }
     if (strcmp(key, "chain_params") == 0) {
-        const char *json = "["
-            "{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":10},"
-            "{\"key\":\"A_sample_path\",\"name\":\"A Sample\",\"type\":\"filepath\",\"root\":\"/data/UserData/breakbeat-samples\",\"filter\":\".wav\"},"
-            "{\"key\":\"A_sample_length\",\"name\":\"A Length\",\"type\":\"enum\",\"options\":[\"1/4 bar\",\"1/2 bar\",\"1 bar\",\"2 bars\",\"4 bars\",\"8 bars\"]},"
-            "{\"key\":\"B_sample_path\",\"name\":\"B Sample\",\"type\":\"filepath\",\"root\":\"/data/UserData/breakbeat-samples\",\"filter\":\".wav\"},"
-            "{\"key\":\"B_sample_length\",\"name\":\"B Length\",\"type\":\"enum\",\"options\":[\"1/4 bar\",\"1/2 bar\",\"1 bar\",\"2 bars\",\"4 bars\",\"8 bars\"]},"
-            "{\"key\":\"B_chance\",\"name\":\"B Chance\",\"type\":\"int\",\"min\":0,\"max\":100},"
-            "{\"key\":\"complexity\",\"name\":\"Complexity\",\"type\":\"int\",\"min\":0,\"max\":100},"
-            "{\"key\":\"phrase\",\"name\":\"Phrase\",\"type\":\"enum\",\"options\":[\"Off\",\"2 bars\",\"4 bars\",\"8 bars\",\"16 bars\"]},"
-            "{\"key\":\"anchor\",\"name\":\"Anchor\",\"type\":\"int\",\"min\":0,\"max\":100},"
-            "{\"key\":\"roll\",\"name\":\"Roll\",\"type\":\"int\",\"min\":0,\"max\":100},"
-            "{\"key\":\"fill\",\"name\":\"Fill\",\"type\":\"int\",\"min\":0,\"max\":100},"
-            "{\"key\":\"retrigger\",\"name\":\"Retrigger\",\"type\":\"int\",\"min\":0,\"max\":100},"
-            "{\"key\":\"retrigger_rate\",\"name\":\"Retrig Rate\",\"type\":\"enum\",\"options\":[\"2x\",\"3x\",\"4x\",\"8x\",\"Rand\"]},"
-            "{\"key\":\"save_preset\",\"name\":\"Save Preset\",\"type\":\"int\",\"min\":0,\"max\":1},"
-            "{\"key\":\"status\",\"name\":\"Status\",\"type\":\"enum\",\"options\":[\"-\"]}"
-        "]";
-        strncpy(buf, json, buf_len);
-        return strlen(json);
+        build_chain_params(bb, buf, buf_len);
+        return (int)strlen(buf);
     }
     if (strcmp(key, "preset_count") == 0) {
         return snprintf(buf, buf_len, "%d", g_total_presets);
@@ -1173,11 +1237,17 @@ static int bb_get_param(void *instance, const char *key, char *buf, int buf_len)
     else if (strcmp(key, "fill") == 0) {
         return snprintf(buf, buf_len, "%d", (int)(bb->fill * 100.0f));
     }
-    else if (strcmp(key, "retrigger") == 0) {
-        return snprintf(buf, buf_len, "%d", (int)(bb->retrigger_prob * 100.0f));
+    else if (strcmp(key, "retrig_2x") == 0) {
+        return snprintf(buf, buf_len, "%d", (int)(bb->retrig_p[0] * 100.0f));
     }
-    else if (strcmp(key, "retrigger_rate") == 0) {
-        return snprintf(buf, buf_len, "%d", bb->retrigger_rate_idx);
+    else if (strcmp(key, "retrig_3x") == 0) {
+        return snprintf(buf, buf_len, "%d", (int)(bb->retrig_p[1] * 100.0f));
+    }
+    else if (strcmp(key, "retrig_4x") == 0) {
+        return snprintf(buf, buf_len, "%d", (int)(bb->retrig_p[2] * 100.0f));
+    }
+    else if (strcmp(key, "retrig_8x") == 0) {
+        return snprintf(buf, buf_len, "%d", (int)(bb->retrig_p[3] * 100.0f));
     }
     else if (strcmp(key, "B_chance") == 0) {
         return snprintf(buf, buf_len, "%d", (int)(bb->swap_prob * 100.0f));
@@ -1197,18 +1267,17 @@ static int bb_get_param(void *instance, const char *key, char *buf, int buf_len)
         else if (bb->phrase_bars == 8) phrase_idx = 3;
         else if (bb->phrase_bars == 16) phrase_idx = 4;
 
-        return snprintf(buf, buf_len, "{\"preset\":%d,\"sample_path\":\"%s\",\"alt_sample_path\":\"%s\",\"length\":%d,\"complexity\":%d,\"anchor\":%d,\"roll\":%d,\"phrase\":%d,\"fill\":%d,\"retrigger\":%d,\"retrigger_rate\":%d,\"swap_prob\":%d}",
+        return snprintf(buf, buf_len,
+            "{\"preset\":%d,\"sample_path\":\"%s\",\"alt_sample_path\":\"%s\","
+            "\"length\":%d,\"complexity\":%d,\"anchor\":%d,\"roll\":%d,\"phrase\":%d,\"fill\":%d,"
+            "\"retrig_2x\":%d,\"retrig_3x\":%d,\"retrig_4x\":%d,\"retrig_8x\":%d,\"swap_prob\":%d}",
             bb->preset_idx,
-            bb->main_sample_path,
-            bb->alt_sample_path,
+            bb->main_sample_path, bb->alt_sample_path,
             len_idx,
-            (int)(bb->complexity * 100.0f),
-            (int)(bb->anchor * 100.0f),
-            (int)(bb->roll * 100.0f),
-            phrase_idx,
-            (int)(bb->fill * 100.0f),
-            (int)(bb->retrigger_prob * 100.0f),
-            bb->retrigger_rate_idx,
+            (int)(bb->complexity * 100.0f), (int)(bb->anchor * 100.0f),
+            (int)(bb->roll * 100.0f), phrase_idx, (int)(bb->fill * 100.0f),
+            (int)(bb->retrig_p[0] * 100.0f), (int)(bb->retrig_p[1] * 100.0f),
+            (int)(bb->retrig_p[2] * 100.0f), (int)(bb->retrig_p[3] * 100.0f),
             (int)(bb->swap_prob * 100.0f));
     }
     
@@ -1335,13 +1404,18 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
     }
     bb->was_running = running;
 
-    if (!running) {
+    int previewing = (bb->preview_frames > 0);
+    if (!running && !previewing) {
         if (bb->dbg_silence_reason != 2) {
             bb->dbg_silence_reason = 2;
             wp_log("breakbeat: silence — transport stopped");
         }
         memset(out_lr, 0, frames * 2 * sizeof(int16_t));
         return;
+    }
+    if (previewing) {
+        bb->preview_frames -= frames;
+        if (bb->preview_frames < 0) bb->preview_frames = 0;
     }
     bb->dbg_silence_reason = 0;
 
@@ -1499,14 +1573,19 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
                       ? (beat_pos)                                           \
                       : slice_select_next(&_in, bb_rand, NULL);             \
     bb->sub_slice_counter = 0;                                               \
-    if ((float)rand() / (float)RAND_MAX < bb->retrigger_prob) {             \
-        bb->sub_slice_active = 1;                                            \
-        if (bb->retrigger_rate_idx == 4) {                                  \
-            int _r = rand() % 4;                                             \
-            bb->retrigger_divisions = (_r==0)?2:(_r==1)?3:(_r==2)?4:8;     \
+    {   /* Roll each retrigger rate independently; pick one if any fire. */  \
+        static const int _rdivs[4] = {2, 3, 4, 8};                          \
+        int _fired[4], _n = 0;                                               \
+        for (int _i = 0; _i < 4; _i++)                                      \
+            if (bb->retrig_p[_i] > 0.0f &&                                  \
+                (float)rand() / (float)RAND_MAX < bb->retrig_p[_i])         \
+                _fired[_n++] = _i;                                           \
+        if (_n > 0) {                                                        \
+            bb->sub_slice_active = 1;                                        \
+            bb->retrigger_divisions = _rdivs[_fired[rand() % _n]];          \
+        } else {                                                              \
+            bb->sub_slice_active = 0;                                        \
         }                                                                    \
-    } else {                                                                 \
-        bb->sub_slice_active = 0;                                            \
     }                                                                        \
     snprintf(bb->status_str, sizeof(bb->status_str), "%c_%d_%dx",           \
              bb->current_loop, bb->current_slice,                            \

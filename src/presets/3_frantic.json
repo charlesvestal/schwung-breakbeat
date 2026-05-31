@@ -10,6 +10,8 @@
   "anchor": 16,
   "roll": 0,
   "fill": 0,
-  "retrigger": 25,
-  "retrigger_rate": "8x"
+  "retrig_2x": 0,
+  "retrig_3x": 0,
+  "retrig_4x": 0,
+  "retrig_8x": 25
 }

@@ -11,6 +11,7 @@
 #include "plugin_api_v1.h"
 #include "slice_select.h"
 #include <time.h>
+#include <math.h>
 
 /* WAV audio format codes */
 #define WAV_FORMAT_PCM   1
@@ -302,9 +303,9 @@ static void sample_dirname(const char *path, char *dir, size_t dir_len) {
 }
 
 static void build_ui_hierarchy(const breakbeat_t *bb, char *out, int out_len) {
-    char ar[BB_PATH_MAX], br[BB_PATH_MAX];
-    sample_dirname(bb->main_sample_path, ar, sizeof(ar));
-    sample_dirname(bb->alt_sample_path,  br, sizeof(br));
+    (void)bb;
+    const char *ar = BB_PORTAL_DIR;
+    const char *br = BB_PORTAL_DIR;
     snprintf(out, out_len,
         "{\"modes\":null,\"levels\":{\"root\":{"
         "\"list_param\":\"preset\",\"count_param\":\"preset_count\",\"name_param\":\"preset_name\","
@@ -334,9 +335,9 @@ static void build_ui_hierarchy(const breakbeat_t *bb, char *out, int out_len) {
 }
 
 static void build_chain_params(const breakbeat_t *bb, char *out, int out_len) {
-    char ar[BB_PATH_MAX], br[BB_PATH_MAX];
-    sample_dirname(bb->main_sample_path, ar, sizeof(ar));
-    sample_dirname(bb->alt_sample_path,  br, sizeof(br));
+    (void)bb;
+    const char *ar = BB_PORTAL_DIR;
+    const char *br = BB_PORTAL_DIR;
     snprintf(out, out_len,
         "["
         "{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":10},"
@@ -743,13 +744,14 @@ static void bb_destroy_instance(void *instance) {
 static void bb_start_preview(breakbeat_t *bb) {
     float bpm = (bb->stable_bpm > 20.0f) ? bb->stable_bpm : 120.0f;
     float spb = ((float)MOVE_SAMPLE_RATE * 60.0f / bpm) * 4.0f;
-    bb->preview_frames = (int)(spb * bb->active_length);
-    bb->play_pos       = (float)bb->slice_starts[0];
-    bb->current_slice  = 0;
-    bb->trigger_phase  = 0.0f;
-    bb->bar_phase      = 0.0f;
-    bb->trigger_count  = 0;
-    bb->bar_counter    = 0;
+    bb->preview_frames      = (int)(spb * bb->active_length);
+    bb->play_pos            = (float)bb->slice_starts[0];
+    bb->current_slice       = 0;
+    bb->trigger_phase       = 0.0f;
+    bb->bar_phase           = 0.0f;
+    bb->trigger_count       = 0;
+    bb->bar_counter         = 0;
+    bb->samples_per_trigger = 0.0f;  /* force BPM-based timing; MIDI ticks not running */
 }
 
 static void bb_reset_transport(breakbeat_t *bb) {
@@ -1573,13 +1575,26 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
                       ? (beat_pos)                                           \
                       : slice_select_next(&_in, bb_rand, NULL);             \
     bb->sub_slice_counter = 0;                                               \
-    {   /* Roll each retrigger rate independently; pick one if any fire. */  \
+    {   /* Roll each retrigger rate independently; pick one if any fire.      \
+         * retrig_p[i] is a per-bar probability set by the user.             \
+         * Convert to per-trigger using the exact inverse binomial formula:  \
+         *   p_trig = 1 - (1 - p_bar)^(1/N)  where N = triggers per bar     \
+         * This ensures 100% always fires and 0% never fires, and all        \
+         * intermediate values are perceptually proportional to bar odds.    \
+         * N = 8 / active_length (e.g. 8 for 1-bar, 4 for 2-bar loops).    */ \
         static const int _rdivs[4] = {2, 3, 4, 8};                          \
+        float _tpb = (bb->active_length > 0.0f)                             \
+                   ? (8.0f / bb->active_length) : 8.0f;                     \
+        float _inv_tpb = 1.0f / _tpb;                                       \
         int _fired[4], _n = 0;                                               \
-        for (int _i = 0; _i < 4; _i++)                                      \
-            if (bb->retrig_p[_i] > 0.0f &&                                  \
-                (float)rand() / (float)RAND_MAX < bb->retrig_p[_i])         \
+        for (int _i = 0; _i < 4; _i++) {                                    \
+            float _pb = bb->retrig_p[_i];                                   \
+            if (_pb <= 0.0f) continue;                                       \
+            float _p = (_pb >= 1.0f) ? 1.0f                                 \
+                                     : 1.0f - powf(1.0f - _pb, _inv_tpb);  \
+            if ((float)rand() / (float)RAND_MAX < _p)                       \
                 _fired[_n++] = _i;                                           \
+        }                                                                    \
         if (_n > 0) {                                                        \
             bb->sub_slice_active = 1;                                        \
             bb->retrigger_divisions = _rdivs[_fired[rand() % _n]];          \

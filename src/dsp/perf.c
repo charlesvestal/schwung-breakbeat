@@ -34,7 +34,13 @@ bb_pad_t bb_perf_decode(int note) {
 
 void bb_perf_slice_push(bb_perf_t *p, int slice) {
     if (!p || slice < 0 || slice > 7) return;
-    if (p->slice_count >= 8) return;   /* full; ignore (8 pads max anyway) */
+    /* A slice occupies at most one stack entry. If it's already held (e.g. a
+     * controller resent note-on without a note-off), remove the old entry and
+     * re-append so it becomes the top (preserves last-note priority) without
+     * leaving a duplicate that a single note-off couldn't clear — which would
+     * otherwise latch the slice as a stuck note. */
+    bb_perf_slice_release(p, slice);
+    if (p->slice_count >= 8) return;   /* full; ignore (8 distinct slices max) */
     p->slice_stack[p->slice_count++] = slice;
 }
 
@@ -117,6 +123,21 @@ int bb_perf_active(const bb_perf_t *p) {
     return (p->slice_count > 0)
         || p->reverse || p->randomize || p->freeze || p->ab_swap
         || p->half_held || p->double_held || (p->stutter_div > 0);
+}
+
+int bb_perf_trigger_fires(const bb_perf_t *p, float *acc) {
+    if (!acc) return 1;
+    float m = p ? p->rate_mult : 1.0f;
+    if (m <= 0.0f) m = 1.0f;
+    /* Only slow rates gate triggers; fast rates (2×) fire every clock and repeat
+     * the slice within the interval instead. Cap the cadence at 1.0/trigger. */
+    float cadence = (m < 1.0f) ? m : 1.0f;
+    *acc += cadence;
+    if (*acc >= 0.999f) {   /* 0.5+0.5 lands cleanly */
+        *acc -= 1.0f;
+        return 1;
+    }
+    return 0;
 }
 
 int bb_perf_status_str(const bb_perf_t *p, int engine_slice, char bank,

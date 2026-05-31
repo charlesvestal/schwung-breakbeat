@@ -47,6 +47,54 @@ All four retrigger knobs are independent — any combination can be active at on
 | **Save Preset** | toggle | Saves current settings as a new JSON file in `presets/`. |
 | **Status** | read-only | Displays current playing loop, slice, and retrig status (e.g., `A_3_1x`). |
 
+## Live Performance (MIDI pads)
+
+On top of the generative engine there's a **live performance layer**: momentary
+MIDI notes that override the engine while held. Send the module MIDI notes (from
+the Move pads, an external controller, or a sequencer) — note-on engages an
+effect, note-off releases it. Nothing latches: release everything and the
+generative engine seamlessly resumes on the next tick. While any pad is held, a
+**LIVE** overlay on the screen shows what's sounding (e.g. `A:3 .5x REV`).
+
+> **Note range note:** the map below is the module's *raw MIDI note* assignment
+> (base note 36, +8 per row). How the Move's physical pads map onto these notes
+> is a host-side concern still being finalised — for now drive it with raw notes
+> from a controller or sequencer.
+
+### MIDI map
+
+| Notes | Row | Function |
+|---|---|---|
+| **36–43** | 0 (base) | A-slice 0–7 — play a slice of sample A (momentary) |
+| **44–51** | 1 | A-slice 0–7 — same as row 0 (kept for muscle memory) |
+| **52–59** | 2 | B-slice 0–7 — *Phase 1: plays from the A buffer* |
+| **60–67** | 3 | Macros (see below) |
+
+#### Slice pads (rows 0–2)
+
+Hold a slice pad to jump to and re-trigger that slice in time with the clock.
+**Last-note priority:** pressing a new slice pad overrides the current one;
+releasing it falls back to whatever slice is still held, then to the engine.
+Every press is momentary — a slice can only be held once, so a single note-off
+always fully releases it (no stuck notes).
+
+#### Macro pads (row 3)
+
+| Note | Macro | While held |
+|---|---|---|
+| **60** | A/B swap | Flip the engine to the other sample bank *(Phase 2)* |
+| **61** | Reverse | Slice plays backward, looping within its bounds |
+| **62** | Randomize | Every trigger picks a fresh random slice |
+| **63** | Freeze | Latch the current slice and keep re-triggering it |
+| **64** | ½× (half speed) | Slice plays an octave down **and** half as fast (re-triggers every other beat) |
+| **65** | 2× (double speed) | Slice plays an octave up and twice as fast (re-triggers within the beat) |
+| **66** | Stutter | Forces a sub-slice retrigger — 4× normally, 8× at velocity ≥ 100 |
+| **67** | Reseed | One-shot: re-rolls the RNG and forces an immediate new slice pick |
+
+All macros are momentary and stack. ½× and 2× held together cancel to 1×.
+Reverse combines with any speed. Stutter layers on top of everything. A held
+slice pad always wins over Randomize and Freeze (explicit beats automatic).
+
 ## Dynamic Presets & Custom Samples
 
 Presets are no longer hardcoded in C. They are stored as `.json` files in the `presets/` directory. The module scans this directory on startup and when saving a new preset.
@@ -110,10 +158,10 @@ After install, restart Schwung on the device to load the module.
 
 ## Testing
 
-Pure slice-selection logic is host-testable:
+Pure slice-selection and performance-layer logic are host-testable:
 
 ```bash
-./tests/run_tests.sh  # compiles tests/test_slice_select.c and runs assertions
+./tests/run_tests.sh  # compiles + runs test_slice_select.c and test_perf.c
 ```
 
 ## SSH setup (Mac → Move)
@@ -143,6 +191,17 @@ ssh-keygen -R move.local
 ```
 
 ## Changelog
+
+### v0.4.x — Live performance layer
+- **Momentary MIDI-pad performance system.** Slice pads (notes 36–59) and macro
+  pads (60–67) override the generative engine while held; release to resume. See
+  the [MIDI map](#midi-map) above.
+- **Live overlay.** A `LIVE` box shows the held slice and active macros (e.g.
+  `A:3 .5x REV`) while you're playing, hidden when you're not.
+- **½×/2× are true half/double speed**, not just pitch: ½× re-triggers the slice
+  every other beat (plays twice as long), 2× re-triggers within the beat.
+- **No stuck notes.** Repeated note-ons for the same slice dedupe to one held
+  entry, so a single note-off always releases it.
 
 ### v0.4.0
 - **Multi-rate retrigger.** Replaced the single Retrigger + Retrig Rate pair with four independent per-bar probability knobs (Retrig 2x / 3x / 4x / 8x). Any combination can be active simultaneously; if multiple rates fire on the same beat one is chosen at random. Probabilities are normalised correctly using the inverse binomial formula so 100% guarantees the rate fires on every beat and 5% means roughly 5% of bars. Old presets migrate automatically.

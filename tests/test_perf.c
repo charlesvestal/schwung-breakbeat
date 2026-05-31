@@ -103,15 +103,31 @@ int main(void) {
         ASSERT_EQ(p.slice_count, 0, "release absent no-op");
     }
 
-    /* === slice stack: duplicate presses each get an entry === */
+    /* === slice stack: duplicate presses dedupe (momentary, no latching) ===
+     * Real MIDI may resend note-ons without a matching note-off. A slice must
+     * occupy at most ONE stack entry, so a single note-off always fully
+     * releases it. Otherwise repeated note-ons latch the slice (stuck note). */
     {
         bb_perf_t p; bb_perf_init(&p);
         bb_perf_slice_push(&p, 4);
         bb_perf_slice_push(&p, 4);
-        ASSERT_EQ(p.slice_count, 2, "two entries for repeated slice");
+        bb_perf_slice_push(&p, 4);   /* repeated note-ons */
+        ASSERT_EQ(p.slice_count, 1, "repeated note-ons: single entry");
         bb_perf_slice_release(&p, 4);
-        ASSERT_EQ(p.slice_count, 1, "one release leaves one");
-        ASSERT_EQ(bb_perf_top_slice(&p), 4, "still holding 4");
+        ASSERT_EQ(p.slice_count, 0, "one note-off fully releases");
+        ASSERT_EQ(bb_perf_top_slice(&p), -1, "not stuck after release");
+    }
+
+    /* === slice stack: re-press moves to top (keeps last-note priority) === */
+    {
+        bb_perf_t p; bb_perf_init(&p);
+        bb_perf_slice_push(&p, 1);
+        bb_perf_slice_push(&p, 2);
+        bb_perf_slice_push(&p, 1);   /* re-press 1 while 2 still held */
+        ASSERT_EQ(p.slice_count, 2, "re-press: still two distinct slices");
+        ASSERT_EQ(bb_perf_top_slice(&p), 1, "re-press brings slice to top");
+        bb_perf_slice_release(&p, 1);
+        ASSERT_EQ(bb_perf_top_slice(&p), 2, "after releasing 1, 2 sounds");
     }
 
     /* === resolve: priority held > freeze > randomize > engine === */
@@ -267,6 +283,48 @@ int main(void) {
         char buf[32];
         bb_perf_status_str(&p, 0, 'A', buf, sizeof(buf));
         ASSERT_TRUE(strcmp(buf, "A:2 2x REV FRZ") == 0, "ordered tokens");
+    }
+
+    /* === trigger gating: 1× fires every clock trigger === */
+    {
+        bb_perf_t p; bb_perf_init(&p);
+        float acc = 0.0f;
+        for (int i = 0; i < 8; i++)
+            ASSERT_EQ(bb_perf_trigger_fires(&p, &acc), 1, "1x: fire every trigger");
+    }
+
+    /* === trigger gating: ½× fires every other trigger (half-time) === */
+    {
+        bb_perf_t p; bb_perf_init(&p);
+        bb_perf_macro_on(&p, BB_MACRO_HALF, 64);   /* rate_mult 0.5 */
+        float acc = 0.0f;
+        int fires[6];
+        for (int i = 0; i < 6; i++) fires[i] = bb_perf_trigger_fires(&p, &acc);
+        ASSERT_EQ(fires[0], 0, "half: skip 1st");
+        ASSERT_EQ(fires[1], 1, "half: fire 2nd");
+        ASSERT_EQ(fires[2], 0, "half: skip 3rd");
+        ASSERT_EQ(fires[3], 1, "half: fire 4th");
+        ASSERT_EQ(fires[4], 0, "half: skip 5th");
+        ASSERT_EQ(fires[5], 1, "half: fire 6th");
+    }
+
+    /* === trigger gating: 2× fires every clock (doubling is intra-slice) === */
+    {
+        bb_perf_t p; bb_perf_init(&p);
+        bb_perf_macro_on(&p, BB_MACRO_DOUBLE, 64);   /* rate_mult 2.0 */
+        float acc = 0.0f;
+        for (int i = 0; i < 4; i++)
+            ASSERT_EQ(bb_perf_trigger_fires(&p, &acc), 1, "double: fire every trigger");
+    }
+
+    /* === trigger gating: ½×+2× cancel to 1× === */
+    {
+        bb_perf_t p; bb_perf_init(&p);
+        bb_perf_macro_on(&p, BB_MACRO_HALF, 64);
+        bb_perf_macro_on(&p, BB_MACRO_DOUBLE, 64);   /* rate_mult 1.0 */
+        float acc = 0.0f;
+        for (int i = 0; i < 4; i++)
+            ASSERT_EQ(bb_perf_trigger_fires(&p, &acc), 1, "half+double: fire every trigger");
     }
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

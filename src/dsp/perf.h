@@ -112,4 +112,15 @@ int bb_perf_active(const bb_perf_t *p);
 int bb_perf_status_str(const bb_perf_t *p, int engine_slice, char bank,
                        char *out, int len);
 
+/* Trigger gating for the ½× macro. Call once per incoming clock trigger;
+ * returns 1 if a new slice trigger should fire now, 0 to skip it:
+ *   - rate_mult >= 1.0 (1× / 2×): always 1 (fire every clock trigger)
+ *   - ½×  (rate_mult 0.5): 0,1,0,1,… so the held/engine slice plays across two
+ *     clock intervals — "twice as long", i.e. half-time.
+ * `*acc` is persistent caller state (init 0). The pitch/length change comes from
+ * rate *= rate_mult separately; for 2× the slice repeats within the interval via
+ * an intra-slice loop in the render path (see breakbeat.c), giving the design's
+ * "plays in half the time then re-triggers". */
+int bb_perf_trigger_fires(const bb_perf_t *p, float *acc);
+
 #endif /* BB_PERF_H */

@@ -38,6 +38,7 @@ typedef struct {
 
     /* Live performance layer (momentary MIDI-pad overrides). */
     bb_perf_t perf;
+    float perf_trig_acc;   /* accumulator for ½×/2× trigger-cadence */
 
     // WAV file state
     int fd;
@@ -701,6 +702,7 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     bb->bar_counter = 0;
     bb->reseed_pending = 0;
     bb_perf_init(&bb->perf);
+    bb->perf_trig_acc = 0.0f;
     bb->fd = -1;
     bb->dbg_first_render = 1;
     bb->dbg_silence_reason = 0;
@@ -1691,7 +1693,12 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
     if (tick_mode) {
         if (bb->pending_trigger) {
             bb->pending_trigger = 0;
-            BB_FIRE_TRIGGER(bb->pending_beat_pos);
+            /* ½× gates triggers so the slice plays across two clock intervals
+             * (half-time); skip means let the current slice keep sounding. 2×
+             * still fires every trigger and repeats the slice within the
+             * interval (intra-slice loop below). */
+            if (bb_perf_trigger_fires(&bb->perf, &bb->perf_trig_acc))
+                BB_FIRE_TRIGGER(bb->pending_beat_pos);
         }
     } else {
         /* Fallback: phase accumulator. */
@@ -1700,7 +1707,8 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
             bb->trigger_phase -= spt;
             int bp = bb->trigger_count % 8;
             bb->trigger_count++;
-            BB_FIRE_TRIGGER(bp);
+            if (bb_perf_trigger_fires(&bb->perf, &bb->perf_trig_acc))
+                BB_FIRE_TRIGGER(bp);
         }
     }
 #undef BB_FIRE_TRIGGER
@@ -1799,6 +1807,16 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
                 bb->play_pos = (float)(_rs + (_rl > 0 ? _rl - 1 : 0));
         } else {
             bb->play_pos += rate;
+            /* Live 2× (double-time): the slice plays at double rate, so it
+             * reaches its end mid-interval. Loop it back to the start to repeat
+             * within the same clock interval ("plays in half the time then
+             * re-triggers") instead of bleeding into the next slice's audio. */
+            if (bb->perf.rate_mult > 1.0f) {
+                uint32_t _ds = bb->slice_starts[bb->current_slice];
+                uint32_t _dl = bb->slice_lengths[bb->current_slice];
+                if (_dl > 0 && bb->play_pos >= (float)(_ds + _dl))
+                    bb->play_pos = (float)_ds;
+            }
         }
     }
     bb->sample_counter += frames;

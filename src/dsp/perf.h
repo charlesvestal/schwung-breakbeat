@@ -54,8 +54,9 @@ typedef enum {
 } bb_resolve_mode_t;
 
 typedef struct {
-    int   slice_stack[8];  /* held slice pads, most-recent last  */
-    int   slice_count;     /* depth of the stack (0 = none held) */
+    int   slice_stack[8];  /* held slice pads (slice index), most-recent last */
+    int   slice_bank[8];   /* bank per stack entry: 0 = A, 1 = B             */
+    int   slice_count;     /* depth of the stack (0 = none held)             */
 
     int   reverse;         /* macro REVERSE held   */
     int   randomize;       /* macro RANDOMIZE held  */
@@ -79,16 +80,21 @@ void bb_perf_init(bb_perf_t *p);
 /* Decode a raw MIDI note into a pad. Returns {BB_PAD_NONE,-1} if out of range. */
 bb_pad_t bb_perf_decode(int note);
 
-/* Push a held slice pad (last-note priority). Duplicate slices each get their
- * own stack entry so rapid re-presses behave naturally. No-op if full. */
-void bb_perf_slice_push(bb_perf_t *p, int slice);
+/* Push a held slice pad (last-note priority) for the given bank (0=A, 1=B).
+ * A (slice,bank) pair occupies at most one entry; a re-press moves it to the
+ * top. A-slice 3 and B-slice 3 are distinct pads, so both can be held at once.
+ * No-op if full. */
+void bb_perf_slice_push(bb_perf_t *p, int slice, int bank);
 
-/* Release a held slice pad: removes the most-recent stack entry matching
- * `slice`, preserving order of the rest. No-op if not present. */
-void bb_perf_slice_release(bb_perf_t *p, int slice);
+/* Release a held slice pad: removes the most-recent entry matching
+ * (slice,bank), preserving order of the rest. No-op if not present. */
+void bb_perf_slice_release(bb_perf_t *p, int slice, int bank);
 
-/* Top of the held-slice stack, or -1 if none held. */
+/* Slice index at the top of the held-slice stack, or -1 if none held. */
 int bb_perf_top_slice(const bb_perf_t *p);
+
+/* Bank (0=A, 1=B) of the top held slice, or -1 if none held. */
+int bb_perf_top_bank(const bb_perf_t *p);
 
 /* Engage a macro on note-on. velocity is unused (kept for call-site symmetry). */
 void bb_perf_macro_on(bb_perf_t *p, int macro, int velocity);

@@ -3,7 +3,7 @@
 
 void bb_perf_init(bb_perf_t *p) {
     if (!p) return;
-    for (int i = 0; i < 8; i++) p->slice_stack[i] = 0;
+    for (int i = 0; i < 8; i++) { p->slice_stack[i] = 0; p->slice_bank[i] = 0; }
     p->slice_count    = 0;
     p->reverse        = 0;
     p->randomize      = 0;
@@ -31,28 +31,33 @@ bb_pad_t bb_perf_decode(int note) {
     return r;
 }
 
-void bb_perf_slice_push(bb_perf_t *p, int slice) {
+void bb_perf_slice_push(bb_perf_t *p, int slice, int bank) {
     if (!p || slice < 0 || slice > 7) return;
-    /* A slice occupies at most one stack entry. If it's already held (e.g. a
-     * controller resent note-on without a note-off), remove the old entry and
-     * re-append so it becomes the top (preserves last-note priority) without
-     * leaving a duplicate that a single note-off couldn't clear — which would
-     * otherwise latch the slice as a stuck note. */
-    bb_perf_slice_release(p, slice);
-    if (p->slice_count >= 8) return;   /* full; ignore (8 distinct slices max) */
-    p->slice_stack[p->slice_count++] = slice;
+    if (bank != 0 && bank != 1) bank = 0;
+    /* A (slice,bank) pair occupies at most one stack entry. If it's already
+     * held (e.g. a controller resent note-on without a note-off), remove the
+     * old entry and re-append so it becomes the top (preserves last-note
+     * priority) without leaving a duplicate that a single note-off couldn't
+     * clear — which would otherwise latch the slice as a stuck note. */
+    bb_perf_slice_release(p, slice, bank);
+    if (p->slice_count >= 8) return;   /* full; ignore */
+    p->slice_bank[p->slice_count] = bank;
+    p->slice_stack[p->slice_count] = slice;
+    p->slice_count++;
 }
 
-void bb_perf_slice_release(bb_perf_t *p, int slice) {
+void bb_perf_slice_release(bb_perf_t *p, int slice, int bank) {
     if (!p || p->slice_count <= 0) return;
-    /* Remove the most-recent entry matching `slice`, shifting the rest down. */
+    if (bank != 0 && bank != 1) bank = 0;
+    /* Remove the most-recent entry matching (slice,bank), shifting rest down. */
     int found = -1;
     for (int i = p->slice_count - 1; i >= 0; i--) {
-        if (p->slice_stack[i] == slice) { found = i; break; }
+        if (p->slice_stack[i] == slice && p->slice_bank[i] == bank) { found = i; break; }
     }
     if (found < 0) return;
     for (int i = found; i < p->slice_count - 1; i++) {
         p->slice_stack[i] = p->slice_stack[i + 1];
+        p->slice_bank[i]  = p->slice_bank[i + 1];
     }
     p->slice_count--;
 }
@@ -60,6 +65,11 @@ void bb_perf_slice_release(bb_perf_t *p, int slice) {
 int bb_perf_top_slice(const bb_perf_t *p) {
     if (!p || p->slice_count <= 0) return -1;
     return p->slice_stack[p->slice_count - 1];
+}
+
+int bb_perf_top_bank(const bb_perf_t *p) {
+    if (!p || p->slice_count <= 0) return -1;
+    return p->slice_bank[p->slice_count - 1];
 }
 
 void bb_perf_macro_on(bb_perf_t *p, int macro, int velocity) {

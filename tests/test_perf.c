@@ -79,27 +79,27 @@ int main(void) {
     /* === slice stack: push/pop, last-note priority === */
     {
         bb_perf_t p; bb_perf_init(&p);
-        bb_perf_slice_push(&p, 1);
-        bb_perf_slice_push(&p, 2);
-        bb_perf_slice_push(&p, 3);
+        bb_perf_slice_push(&p, 1, 0);
+        bb_perf_slice_push(&p, 2, 0);
+        bb_perf_slice_push(&p, 3, 0);
         ASSERT_EQ(p.slice_count, 3, "stack depth 3");
         ASSERT_EQ(bb_perf_top_slice(&p), 3, "top is 3");
 
         /* release a middle entry → top falls back to 3 */
-        bb_perf_slice_release(&p, 2);
+        bb_perf_slice_release(&p, 2, 0);
         ASSERT_EQ(p.slice_count, 2, "depth 2 after release");
         ASSERT_EQ(bb_perf_top_slice(&p), 3, "top still 3");
 
         /* release the top → falls back to 1 */
-        bb_perf_slice_release(&p, 3);
+        bb_perf_slice_release(&p, 3, 0);
         ASSERT_EQ(bb_perf_top_slice(&p), 1, "top falls back to 1");
 
-        bb_perf_slice_release(&p, 1);
+        bb_perf_slice_release(&p, 1, 0);
         ASSERT_EQ(p.slice_count, 0, "empty");
         ASSERT_EQ(bb_perf_top_slice(&p), -1, "top -1 when empty");
 
         /* releasing absent slice is a no-op */
-        bb_perf_slice_release(&p, 5);
+        bb_perf_slice_release(&p, 5, 0);
         ASSERT_EQ(p.slice_count, 0, "release absent no-op");
     }
 
@@ -109,11 +109,11 @@ int main(void) {
      * releases it. Otherwise repeated note-ons latch the slice (stuck note). */
     {
         bb_perf_t p; bb_perf_init(&p);
-        bb_perf_slice_push(&p, 4);
-        bb_perf_slice_push(&p, 4);
-        bb_perf_slice_push(&p, 4);   /* repeated note-ons */
+        bb_perf_slice_push(&p, 4, 0);
+        bb_perf_slice_push(&p, 4, 0);
+        bb_perf_slice_push(&p, 4, 0);   /* repeated note-ons */
         ASSERT_EQ(p.slice_count, 1, "repeated note-ons: single entry");
-        bb_perf_slice_release(&p, 4);
+        bb_perf_slice_release(&p, 4, 0);
         ASSERT_EQ(p.slice_count, 0, "one note-off fully releases");
         ASSERT_EQ(bb_perf_top_slice(&p), -1, "not stuck after release");
     }
@@ -121,13 +121,45 @@ int main(void) {
     /* === slice stack: re-press moves to top (keeps last-note priority) === */
     {
         bb_perf_t p; bb_perf_init(&p);
-        bb_perf_slice_push(&p, 1);
-        bb_perf_slice_push(&p, 2);
-        bb_perf_slice_push(&p, 1);   /* re-press 1 while 2 still held */
+        bb_perf_slice_push(&p, 1, 0);
+        bb_perf_slice_push(&p, 2, 0);
+        bb_perf_slice_push(&p, 1, 0);   /* re-press 1 while 2 still held */
         ASSERT_EQ(p.slice_count, 2, "re-press: still two distinct slices");
         ASSERT_EQ(bb_perf_top_slice(&p), 1, "re-press brings slice to top");
-        bb_perf_slice_release(&p, 1);
+        bb_perf_slice_release(&p, 1, 0);
         ASSERT_EQ(bb_perf_top_slice(&p), 2, "after releasing 1, 2 sounds");
+    }
+
+    /* === slice stack: A and B slice with same index are distinct pads === */
+    {
+        bb_perf_t p; bb_perf_init(&p);
+        ASSERT_EQ(bb_perf_top_bank(&p), -1, "empty: top bank -1");
+        bb_perf_slice_push(&p, 3, 0);   /* A slice 3 */
+        bb_perf_slice_push(&p, 3, 1);   /* B slice 3 — different pad */
+        ASSERT_EQ(p.slice_count, 2, "A3 and B3 both held");
+        ASSERT_EQ(bb_perf_top_slice(&p), 3, "top slice 3");
+        ASSERT_EQ(bb_perf_top_bank(&p), 1, "top bank is B");
+        /* releasing B3 falls back to A3 */
+        bb_perf_slice_release(&p, 3, 1);
+        ASSERT_EQ(p.slice_count, 1, "B3 released, A3 remains");
+        ASSERT_EQ(bb_perf_top_bank(&p), 0, "now top bank is A");
+        /* releasing the wrong bank is a no-op */
+        bb_perf_slice_release(&p, 3, 1);
+        ASSERT_EQ(p.slice_count, 1, "release absent (3,B) no-op");
+        bb_perf_slice_release(&p, 3, 0);
+        ASSERT_EQ(p.slice_count, 0, "A3 released → empty");
+        ASSERT_EQ(bb_perf_top_bank(&p), -1, "empty again");
+    }
+
+    /* === slice stack: same pad re-press dedupes within its bank === */
+    {
+        bb_perf_t p; bb_perf_init(&p);
+        bb_perf_slice_push(&p, 5, 1);
+        bb_perf_slice_push(&p, 5, 1);   /* repeated B5 note-on */
+        ASSERT_EQ(p.slice_count, 1, "repeated B5 → single entry");
+        ASSERT_EQ(bb_perf_top_bank(&p), 1, "still B");
+        bb_perf_slice_release(&p, 5, 1);
+        ASSERT_EQ(p.slice_count, 0, "one note-off clears B5");
     }
 
     /* === resolve: priority held > freeze > randomize > engine === */
@@ -142,7 +174,7 @@ int main(void) {
         p.freeze = 1;
         ASSERT_EQ(bb_perf_resolve(&p, &s), BB_RESOLVE_FREEZE, "freeze beats randomize");
 
-        bb_perf_slice_push(&p, 6);
+        bb_perf_slice_push(&p, 6, 0);
         s = -99;
         ASSERT_EQ(bb_perf_resolve(&p, &s), BB_RESOLVE_HELD, "held beats all");
         ASSERT_EQ(s, 6, "held slice surfaced");
@@ -227,9 +259,9 @@ int main(void) {
     {
         bb_perf_t p; bb_perf_init(&p);
         ASSERT_EQ(bb_perf_active(&p), 0, "inert → not active");
-        bb_perf_slice_push(&p, 2);
+        bb_perf_slice_push(&p, 2, 0);
         ASSERT_EQ(bb_perf_active(&p), 1, "held slice → active");
-        bb_perf_slice_release(&p, 2);
+        bb_perf_slice_release(&p, 2, 0);
         ASSERT_EQ(bb_perf_active(&p), 0, "released → not active");
         bb_perf_macro_on(&p, BB_MACRO_REVERSE, 1);
         ASSERT_EQ(bb_perf_active(&p), 1, "macro → active");
@@ -253,7 +285,7 @@ int main(void) {
     /* === status_str: held slice, 1-based, with bank === */
     {
         bb_perf_t p; bb_perf_init(&p);
-        bb_perf_slice_push(&p, 2);   /* 0-based 2 → "3" */
+        bb_perf_slice_push(&p, 2, 0);   /* 0-based 2 → "3" */
         char buf[32];
         bb_perf_status_str(&p, 7, 'A', buf, sizeof(buf));
         ASSERT_TRUE(strcmp(buf, "A:3") == 0, "held slice → 'A:3'");
@@ -271,7 +303,7 @@ int main(void) {
     /* === status_str: held slice beats engine slice, with speed macro === */
     {
         bb_perf_t p; bb_perf_init(&p);
-        bb_perf_slice_push(&p, 0);                 /* → "1" */
+        bb_perf_slice_push(&p, 0, 0);                 /* → "1" */
         bb_perf_macro_on(&p, BB_MACRO_HALF, 64);
         char buf[32];
         bb_perf_status_str(&p, 6, 'A', buf, sizeof(buf));
@@ -290,7 +322,7 @@ int main(void) {
     /* === status_str: token order is stable (.5x/2x, REV, FRZ, RND, ST, A/B) === */
     {
         bb_perf_t p; bb_perf_init(&p);
-        bb_perf_slice_push(&p, 1);                       /* "2" */
+        bb_perf_slice_push(&p, 1, 0);                       /* "2" */
         bb_perf_macro_on(&p, BB_MACRO_DOUBLE, 64);
         bb_perf_macro_on(&p, BB_MACRO_REVERSE, 1);
         bb_perf_macro_on(&p, BB_MACRO_FREEZE, 1);

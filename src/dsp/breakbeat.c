@@ -863,8 +863,9 @@ static void bb_on_midi(void *instance, const uint8_t *msg, int len, int source) 
     if (pad.kind == BB_PAD_A_SLICE || pad.kind == BB_PAD_B_SLICE) {
         /* Phase 1: single buffer — B-slice pads play from the A bank. */
         int slice = pad.index;
+        int bank  = (pad.kind == BB_PAD_B_SLICE) ? 1 : 0;
         if (is_note_on) {
-            bb_perf_slice_push(&bb->perf, slice);
+            bb_perf_slice_push(&bb->perf, slice, bank);
             /* Instant hit: jump now so playing feels responsive, and consume any
              * pending clock trigger so the next tick doesn't fight the jump.
              * Rate-related behavior stays locked to the clock in render_block. */
@@ -879,7 +880,7 @@ static void bb_on_midi(void *instance, const uint8_t *msg, int len, int source) 
         } else {
             /* Pop from the held-slice stack; the next trigger reverts to the new
              * top-of-stack slice, or to the engine when nothing is held. */
-            bb_perf_slice_release(&bb->perf, slice);
+            bb_perf_slice_release(&bb->perf, slice, bank);
         }
         return;
     }

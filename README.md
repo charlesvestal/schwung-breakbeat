@@ -59,22 +59,35 @@ generative engine seamlessly resumes on the next tick.
 > `A:3 .5x REV` while held, empty otherwise). An on-screen overlay that surfaces
 > this in the Signal Chain view is deferred — the chain/shadow UI is drawn by the
 > host, so it needs a host-side hook rather than the module's own `ui.js`.
-
-> **Note range note:** the map below is the module's *raw MIDI note* assignment
-> (base note 36, +8 per row). How the Move's physical pads map onto these notes
-> is a host-side concern still being finalised — for now drive it with raw notes
-> from a controller or sequencer.
+>
+> **Note range:** the map below is the module's *raw MIDI note* assignment (base
+> note 36, +8 per row). Note names use the convention where **C3 = 60** (middle C
+> = note 60). How the Move's physical pads map onto these notes is a host-side
+> concern still being finalised — for now drive it with raw notes from a
+> controller or sequencer.
 
 ### MIDI map
 
-| Notes | Row | Function |
-|---|---|---|
-| **36–43** | 0 (base) | A-slice 0–7 — play a slice of sample A (momentary) |
-| **44–51** | 1 | A-slice 0–7 — same as row 0 (kept for muscle memory) |
-| **52–59** | 2 | B-slice 0–7 — *Phase 1: plays from the A buffer* |
-| **60–67** | 3 | Macros (see below) |
+| Notes | Names | Row | Function |
+|---|---|---|---|
+| **36–43** | C1–G1 | 0 (base) | A-slice 0–7 — play a slice of sample A (momentary) |
+| **44–51** | G#1–D#2 | 1 | A-slice 0–7 — same as row 0 (kept for muscle memory) |
+| **52–59** | E2–B2 | 2 | B-slice 0–7 — *Phase 1: plays from the A buffer* |
+| **60–67** | C3–G3 | 3 | Macros (see below) |
 
 #### Slice pads (rows 0–2)
+
+| Note | Name | Slice |
+|---|---|---|
+| 36 / 44 | C1 / G#1 | A slice 1 |
+| 37 / 45 | C#1 / A1 | A slice 2 |
+| 38 / 46 | D1 / A#1 | A slice 3 |
+| 39 / 47 | D#1 / B1 | A slice 4 |
+| 40 / 48 | E1 / C2 | A slice 5 |
+| 41 / 49 | F1 / C#2 | A slice 6 |
+| 42 / 50 | F#1 / D2 | A slice 7 |
+| 43 / 51 | G1 / D#2 | A slice 8 |
+| 52–59 | E2–B2 | B slice 1–8 *(Phase 1: from A buffer)* |
 
 Hold a slice pad to jump to and re-trigger that slice in time with the clock.
 **Last-note priority:** pressing a new slice pad overrides the current one;
@@ -84,20 +97,25 @@ always fully releases it (no stuck notes).
 
 #### Macro pads (row 3)
 
-| Note | Macro | While held |
-|---|---|---|
-| **60** | A/B swap | Flip the engine to the other sample bank *(Phase 2)* |
-| **61** | Reverse | Slice plays backward, looping within its bounds |
-| **62** | Randomize | Every trigger picks a fresh random slice |
-| **63** | Freeze | Latch the current slice and keep re-triggering it |
-| **64** | ½× (half speed) | Slice plays an octave down **and** half as fast (re-triggers every other beat) |
-| **65** | 2× (double speed) | Slice plays an octave up and twice as fast (re-triggers within the beat) |
-| **66** | Stutter | Forces a sub-slice retrigger — 4× normally, 8× at velocity ≥ 100 |
-| **67** | Reseed | One-shot: re-rolls the RNG and forces an immediate new slice pick |
+| Note | Name | Macro | While held |
+|---|---|---|---|
+| **60** | C3 | A/B swap | *Phase 2 — not yet active.* Flips the engine to the other sample bank; a no-op in Phase 1 (single buffer). |
+| **61** | C#3 | Reverse | Slice plays backward, looping within its bounds |
+| **62** | D3 | Randomize | Every trigger picks a fresh random slice |
+| **63** | D#3 | Freeze | Latch the current slice and keep re-triggering it |
+| **64** | E3 | ½× (half speed) | Slice plays an octave down **and** half as fast (re-triggers every other beat) |
+| **65** | F3 | 2× (double speed) | Slice plays an octave up and twice as fast (re-triggers within the beat) |
+| **66** | F#3 | Stutter | Forces a sub-slice retrigger — 4× normally, 8× at velocity ≥ 100 |
+| **67** | G3 | Reseed | One-shot: re-rolls the RNG and forces an immediate new slice pick |
 
 All macros are momentary and stack. ½× and 2× held together cancel to 1×.
 Reverse combines with any speed. Stutter layers on top of everything. A held
 slice pad always wins over Randomize and Freeze (explicit beats automatic).
+
+> **A/B swap (note 60) is not functional yet.** It sets a flag but the engine
+> ignores it in Phase 1, because only one sample buffer is resident. It becomes
+> active in Phase 2 (dual A/B buffers), which also makes the B-slice row (52–59)
+> play from the real B sample instead of the A buffer.
 
 ## Dynamic Presets & Custom Samples
 

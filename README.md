@@ -72,7 +72,7 @@ generative engine seamlessly resumes on the next tick.
 |---|---|---|---|
 | **36–43** | C1–G1 | 0 (base) | A-slice 0–7 — play a slice of sample A (momentary) |
 | **44–51** | G#1–D#2 | 1 | A-slice 0–7 — same as row 0 (kept for muscle memory) |
-| **52–59** | E2–B2 | 2 | B-slice 0–7 — *Phase 1: plays from the A buffer* |
+| **52–59** | E2–B2 | 2 | B-slice 0–7 — play a slice of sample B |
 | **60–68** | C3–G#3 | 3+ | Macros (see below) |
 
 #### Slice pads
@@ -87,7 +87,7 @@ generative engine seamlessly resumes on the next tick.
 | 41 / 49 | F1 / C#2 | A slice 6 |
 | 42 / 50 | F#1 / D2 | A slice 7 |
 | 43 / 51 | G1 / D#2 | A slice 8 |
-| 52–59 | E2–B2 | B slice 1–8 *(Phase 1: from A buffer)* |
+| 52–59 | E2–B2 | B slice 1–8 (from sample B) |
 
 Hold a slice pad to jump to and re-trigger that slice in time with the clock.
 **Last-note priority:** pressing a new slice pad overrides the current one;
@@ -99,7 +99,7 @@ always fully releases it (no stuck notes).
 
 | Note | Name | Macro | While held |
 |---|---|---|---|
-| **60** | C3 | A/B swap | *Phase 2 — not yet active.* Flips the engine to the other sample bank; a no-op in Phase 1 (single buffer). |
+| **60** | C3 | A/B swap | Flips the engine to the other sample bank (A↔B) while held |
 | **61** | C#3 | Reverse | Slice plays backward, looping within its bounds |
 | **62** | D3 | Randomize | Every trigger picks a fresh random slice |
 | **63** | D#3 | Freeze | Latch the current slice and keep re-triggering it |
@@ -113,11 +113,6 @@ All macros are momentary and stack. ½× and 2× held together cancel to 1×.
 Reverse combines with any speed. Stutter layers on top of everything; holding
 both Stutter pads gives 8× (the faster wins). A held slice pad always wins over
 Randomize and Freeze (explicit beats automatic).
-
-> **A/B swap (note 60) is not functional yet.** It sets a flag but the engine
-> ignores it in Phase 1, because only one sample buffer is resident. It becomes
-> active in Phase 2 (dual A/B buffers), which also makes the B-slice row (52–59)
-> play from the real B sample instead of the A buffer.
 
 ## Dynamic Presets & Custom Samples
 
@@ -217,6 +212,7 @@ ssh-keygen -R move.local
 ## Changelog
 
 ### v0.4.x — Live performance layer
+- **Dual A/B buffers (Phase 2).** A and B samples are now both resident, so the A/B-swap macro (note 60) flips the engine between banks while held, and the B-slice row (notes 52–59) plays real slices of sample B. Each bank keeps its own length. (Held B slices retrigger at the engine's current cadence; per-bank cadence is a later refinement.)
 - **Stutter split into two pads.** Stutter is now two separate momentary notes — 4× (note 66) and 8× (note 67) — instead of one velocity-sensitive pad. Holding both gives 8×. Reseed moves to note 68.
 - **Momentary MIDI-pad performance system.** Slice pads (notes 36–59) and macro
   pads (60–67) override the generative engine while held; release to resume. See

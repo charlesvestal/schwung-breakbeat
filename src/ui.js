@@ -8,14 +8,16 @@
 import { createEnum, createValue, createBack } from '/data/UserData/schwung/shared/menu_items.mjs';
 import { createMenuState, handleMenuInput } from '/data/UserData/schwung/shared/menu_nav.mjs';
 import { createMenuStack } from '/data/UserData/schwung/shared/menu_stack.mjs';
-import { drawMenuList, drawMenuHeader, drawMenuFooter, menuLayoutDefaults } from '/data/UserData/schwung/shared/menu_layout.mjs';
-import { createValueOverlay } from '/data/UserData/schwung/shared/value_overlay.mjs';
+import { drawMenuList, drawMenuHeader, drawMenuFooter, menuLayoutDefaults, drawRect } from '/data/UserData/schwung/shared/menu_layout.mjs';
 
 const g_loop_names = [
     "action", "amen", "apache", "around", "boogiewoogie", "delight", "do", "eeloil", "fireeater", "funkydrummer", "groove", "hitormiss", "hotline", "hungup_0", "hungup_1", "impeach", "king", "kool", "marymary", "mechanicalman", "movement", "newday", "neworleans", "riffin", "rill", "ripple", "sesame", "sneakin", "sport", "squib", "swat", "think", "useme"
 ];
 
 const length_options = ["0.25", "0.5", "1", "2", "4", "8"];
+
+const SCREEN_WIDTH = 128;
+const SCREEN_HEIGHT = 64;
 
 /* State */
 let menuState;
@@ -24,19 +26,39 @@ let needsRedraw = true;
 
 /* Live performance overlay — shows held slice + active macros (e.g. "A:3 .5x
  * REV") while the user is manually triggering, and nothing otherwise. Driven by
- * the DSP "perf_status" param. Long timeout: we control show/hide explicitly
- * from the live state rather than letting it auto-fade, since perf pads are
- * momentary and the overlay should persist exactly while held. */
-let fxOverlay;
+ * the DSP "perf_status" param, which returns "" when no pad/macro is engaged.
+ * Drawn with the same primitives as the host's shift-knob overlay (there is no
+ * shared overlay factory module on device): a centred, blanked, bordered box.
+ * Visibility is tracked via non-empty perf_status, so it persists exactly while
+ * held (no auto-fade), which suits momentary perf pads. */
 let lastFx = '';
+
+/* Draw the live FX overlay box, mirroring the shift-knob overlay look. Uses the
+ * global draw primitives (print/fill_rect) and drawRect from menu_layout. */
+function drawFxOverlay(text) {
+    const bw = 110, bh = 28;
+    const bx = Math.floor((SCREEN_WIDTH - bw) / 2);
+    const by = Math.floor((SCREEN_HEIGHT - bh) / 2);
+
+    fill_rect(bx, by, bw, bh, 0);   /* blank the menu behind the box */
+    drawRect(bx, by, bw, bh, 1);    /* border                       */
+
+    const label = 'LIVE';
+    const labelX = Math.floor((SCREEN_WIDTH - label.length * 6) / 2);
+    print(labelX, by + 5, label, 1);
+
+    const t = String(text || '');
+    const textX = Math.floor((SCREEN_WIDTH - t.length * 6) / 2);
+    print(textX, by + 16, t, 1);
+}
 
 /* Initialize */
 globalThis.init = function() {
     console.log("Breakbeat UI starting fresh...");
-    
+
     menuState = createMenuState();
     menuStack = createMenuStack();
-    
+
     /* Define parameters menu */
     const paramsMenu = [
         createEnum('Loop', {
@@ -58,7 +80,6 @@ globalThis.init = function() {
 
     menuStack.push({ title: 'Breakbeat', items: paramsMenu });
 
-    fxOverlay = createValueOverlay({ timeoutMs: 3600000 });
     lastFx = '';
 
     needsRedraw = true;
@@ -67,12 +88,11 @@ globalThis.init = function() {
 
 /* Tick */
 globalThis.tick = function() {
-    /* Poll the live performance state each tick. Redraw on any change, and
-     * whenever the overlay is showing so it stays on top of the menu. */
+    /* Poll the live performance state each tick. Redraw whenever it changes:
+     * appearing, changing tokens, or disappearing on release. */
     const fx = host_module_get_param('perf_status') || '';
     if (fx !== lastFx) {
         lastFx = fx;
-        if (fx) fxOverlay.show('LIVE', fx); else fxOverlay.hide();
         needsRedraw = true;
     }
 
@@ -81,7 +101,7 @@ globalThis.tick = function() {
 
         const current = menuStack.current();
         drawMenuHeader(current.title);
-        
+
         drawMenuList({
             items: current.items,
             selectedIndex: menuState.selectedIndex,
@@ -104,11 +124,14 @@ globalThis.tick = function() {
                 return "";
             }
         });
-        
+
         drawMenuFooter("Jog:scroll Click:edit");
 
-        /* Draw the live FX overlay last so it sits on top of the menu. */
-        if (fxOverlay.isVisible()) fxOverlay.draw();
+        /* Draw the live FX overlay last so it sits on top of the menu. Only
+         * while a pad/macro is held (perf_status non-empty). */
+        if (lastFx) {
+            drawFxOverlay(lastFx);
+        }
 
         needsRedraw = false;
     }

@@ -11,3 +11,11 @@ cc -Wall -Wextra -O0 -g -std=c99 \
     -o tests/test_slice_select
 
 ./tests/test_slice_select
+
+cc -Wall -Wextra -O0 -g -std=c99 \
+    -Isrc/dsp \
+    tests/test_perf.c src/dsp/perf.c \
+    -lm \
+    -o tests/test_perf
+
+./tests/test_perf

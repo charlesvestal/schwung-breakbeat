@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include "plugin_api_v1.h"
 #include "slice_select.h"
+#include "perf.h"
 #include <time.h>
 #include <math.h>
 
@@ -34,6 +35,9 @@ typedef struct {
     float fill;
     int   bar_counter;
     int   reseed_pending;
+
+    /* Live performance layer (momentary MIDI-pad overrides). */
+    bb_perf_t perf;
 
     // WAV file state
     int fd;
@@ -696,6 +700,7 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     bb->fill = 0.0f;
     bb->bar_counter = 0;
     bb->reseed_pending = 0;
+    bb_perf_init(&bb->perf);
     bb->fd = -1;
     bb->dbg_first_render = 1;
     bb->dbg_silence_reason = 0;
@@ -843,14 +848,52 @@ static void bb_on_midi(void *instance, const uint8_t *msg, int len, int source) 
     uint8_t note   = msg[1];
     uint8_t vel    = msg[2];
 
-    if (status == 0x90 && vel > 0) {
-        /* Pad presses: notes 36-43 → slices 0-7 */
-        if (note >= 36 && note <= 43) {
-            int slice = note - 36;
-            bb->play_pos      = bb->slice_starts[slice];
-            bb->current_slice = slice;
-            bb->playing = 1;
+    /* Live performance pads — momentary overrides of the generative engine.
+     * Note-on engages an effect; note-off releases it. Note-off arrives as 0x80
+     * or as 0x90 with velocity 0 (running status). */
+    int is_note_on  = (status == 0x90 && vel > 0);
+    int is_note_off = (status == 0x80) || (status == 0x90 && vel == 0);
+    if (!is_note_on && !is_note_off) return;
+
+    bb_pad_t pad = bb_perf_decode(note);
+    if (pad.kind == BB_PAD_NONE) return;
+
+    if (pad.kind == BB_PAD_A_SLICE || pad.kind == BB_PAD_B_SLICE) {
+        /* Phase 1: single buffer — B-slice pads play from the A bank. */
+        int slice = pad.index;
+        if (is_note_on) {
+            bb_perf_slice_push(&bb->perf, slice);
+            /* Instant hit: jump now so playing feels responsive, and consume any
+             * pending clock trigger so the next tick doesn't fight the jump.
+             * Rate-related behavior stays locked to the clock in render_block. */
+            bb->current_slice     = slice;
+            bb->play_pos          = (float)bb->slice_starts[slice];
+            bb->sub_slice_active  = 0;
+            bb->sub_slice_counter = 0;
+            bb->pending_trigger   = 0;
+            bb->playing           = 1;
+            /* Audition instantly even while the transport is stopped. */
+            bb->preview_frames    = MOVE_SAMPLE_RATE / 2;
+        } else {
+            /* Pop from the held-slice stack; the next trigger reverts to the new
+             * top-of-stack slice, or to the engine when nothing is held. */
+            bb_perf_slice_release(&bb->perf, slice);
         }
+        return;
+    }
+
+    /* Macro row. */
+    if (is_note_on) {
+        bb_perf_macro_on(&bb->perf, pad.index, vel);
+        if (bb->perf.reseed_request) {
+            bb->perf.reseed_request = 0;
+            /* "Throw the dice": reseed the RNG and force one immediate re-pick. */
+            srand((unsigned int)(time(NULL) ^ bb->sample_counter ^ (unsigned)note));
+            bb->pending_trigger  = 1;
+            bb->pending_beat_pos = bb->trigger_count % 8;
+        }
+    } else {
+        bb_perf_macro_off(&bb->perf, pad.index);
     }
 }
 
@@ -1189,6 +1232,12 @@ static int bb_get_param(void *instance, const char *key, char *buf, int buf_len)
     }
     else if (strcmp(key, "status") == 0) {
         return snprintf(buf, buf_len, "%s", bb->status_str);
+    }
+    else if (strcmp(key, "perf_status") == 0) {
+        /* Live overlay readout: held slice + active macros, or "" when the
+         * user is not manually triggering anything (so the UI hides it). */
+        return bb_perf_status_str(&bb->perf, bb->current_slice,
+                                  bb->current_loop, buf, buf_len);
     }
     else if (strcmp(key, "A_sample_path") == 0 || strcmp(key, "loop") == 0) {
         char dbg[BB_PATH_MAX + 64];
@@ -1571,9 +1620,18 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
         .bar_in_phrase = bb->phrase_bars > 0                                 \
                        ? bb->bar_counter % bb->phrase_bars : 0,             \
     };                                                                       \
-    bb->current_slice = (bb->complexity == 0.0f)                            \
+    int _bb_engine = (bb->complexity == 0.0f)                            \
                       ? (beat_pos)                                           \
-                      : slice_select_next(&_in, bb_rand, NULL);             \
+                      : slice_select_next(&_in, bb_rand, NULL); \
+    {   /* Live performance override of the engine's slice pick. */          \
+        int _bb_held = -1;                                                   \
+        bb_resolve_mode_t _bb_rm = bb_perf_resolve(&bb->perf, &_bb_held);    \
+        if      (_bb_rm == BB_RESOLVE_HELD)   bb->current_slice = _bb_held;  \
+        else if (_bb_rm == BB_RESOLVE_FREEZE) { /* keep current_slice */ }   \
+        else if (_bb_rm == BB_RESOLVE_RANDOM) bb->current_slice =            \
+                                          ((int)(bb_rand(NULL) * 8.0f)) & 7; \
+        else                                  bb->current_slice = _bb_engine;\
+    }             \
     bb->sub_slice_counter = 0;                                               \
     {   /* Roll each retrigger rate independently; pick one if any fire.      \
          * retrig_p[i] is a per-bar probability set by the user.             \
@@ -1601,6 +1659,10 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
         } else {                                                              \
             bb->sub_slice_active = 0;                                        \
         }                                                                    \
+    }                                                                        \
+    if (bb->perf.stutter_div > 0) { /* Stutter macro forces sub-slice retrigger. */ \
+        bb->sub_slice_active   = 1;                                          \
+        bb->retrigger_divisions = bb->perf.stutter_div;                      \
     }                                                                        \
     snprintf(bb->status_str, sizeof(bb->status_str), "%c_%d_%dx",           \
              bb->current_loop, bb->current_slice,                            \
@@ -1649,6 +1711,7 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
     float slice_len = (bb->current_slice < 8)
                     ? (float)bb->slice_lengths[bb->current_slice] : 0.0f;
     float rate = (slice_len > 0.0f && spt > 0.0f) ? slice_len / spt : 1.0f;
+    rate *= bb->perf.rate_mult;   /* live ½×/2× macros */
 
     const int nch = bb->num_channels;
     const int is_float = (bb->audio_format == WAV_FORMAT_FLOAT);
@@ -1727,7 +1790,16 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
             }
         }
         
-        bb->play_pos += rate;
+        if (bb->perf.reverse) {
+            /* Live Reverse: step backward, wrapping within the slice bounds. */
+            uint32_t _rs = bb->slice_starts[bb->current_slice];
+            uint32_t _rl = bb->slice_lengths[bb->current_slice];
+            bb->play_pos -= rate;
+            if (bb->play_pos < (float)_rs)
+                bb->play_pos = (float)(_rs + (_rl > 0 ? _rl - 1 : 0));
+        } else {
+            bb->play_pos += rate;
+        }
     }
     bb->sample_counter += frames;
 }

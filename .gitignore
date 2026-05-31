@@ -1,4 +1,10 @@
 build/
 dist/
-tests/test_slice_select
-tests/test_slice_select.dSYM/
+*.so
+*.o
+*.dSYM/
+
+# Compiled test binaries (sources are tracked; binaries are not)
+/tests/test_slice_select
+/tests/test_perf
+/tests/test_ramp_gen

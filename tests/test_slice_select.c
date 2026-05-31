@@ -113,6 +113,9 @@ int main(void) {
      * With Complexity=0, p_swap is always 0, so move-branch always falls through
      * to (current+1)&7. Roll=0 means stay-branch never fires. */
     {
+        /* Sequential advance now returns beat_position (not current_slice+1) so
+         * a random swap only affects one beat and the sequence stays aligned.
+         * The slice to play at beat N is always beat_position=N when no swap. */
         test_rng_t rng = { .state = 12345 };
         slice_inputs_t in = {0};
         in.current_slice = 3;
@@ -121,11 +124,19 @@ int main(void) {
         in.phrase_bars = 0;
 
         int next = slice_select_next(&in, test_rand, &rng);
-        ASSERT_TRUE(next == 4, "sequential advance from 3 -> 4");
+        ASSERT_TRUE(next == 3, "sequential: returns beat_position=3");
 
         in.current_slice = 7;
+        in.beat_position = 7;
         next = slice_select_next(&in, test_rand, &rng);
-        ASSERT_TRUE(next == 0, "sequential advance wraps 7 -> 0");
+        ASSERT_TRUE(next == 7, "sequential: returns beat_position=7");
+
+        /* After a random swap (say at beat 4 → slice 1), the next beat still
+         * plays its natural slice (beat_position=5), not current_slice+1=2. */
+        in.current_slice = 1;  /* a random swap landed here */
+        in.beat_position = 5;  /* but we are at beat 5 */
+        next = slice_select_next(&in, test_rand, &rng);
+        ASSERT_TRUE(next == 5, "sequential after swap: beat 5 plays slice 5, not slice 2");
     }
 
     /* === select_next: Roll=1, Anchor=0, current=4 -> walks should occur ===

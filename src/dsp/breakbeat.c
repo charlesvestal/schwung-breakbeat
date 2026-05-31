@@ -116,7 +116,8 @@ typedef struct {
     int alt_loop_idx;
     int main_loop_idx;
 
-    char current_loop;
+    char current_loop;   /* loop actually playing right now ('A' or 'B') */
+    char pending_loop;   /* loop that will play when pending_sample_path loads */
     char status_str[32];
 
     /* Diagnostics — log key events once rather than every block. */
@@ -428,9 +429,17 @@ static int open_wav(breakbeat_t *wp, const char *path, float expected_length) {
     wp->data = (void *)(raw + data_offset);
     wp->total_frames = data_size / (num_channels * bytes_per_sample);
     wp->play_pos = 0;
+    /* Scale samples_per_trigger proportionally when active_length changes so the
+     * playback rate is correct immediately on the first block of the new sample,
+     * without waiting for a full new tick-trigger measurement to arrive. */
+    {
+        int new_tpt = (int)(12.0f * expected_length + 0.5f);
+        if (new_tpt < 1) new_tpt = 1;
+        if (wp->ticks_per_trigger > 0 && wp->samples_per_trigger > 0.0f)
+            wp->samples_per_trigger *= (float)new_tpt / (float)wp->ticks_per_trigger;
+        wp->ticks_per_trigger = new_tpt;
+    }
     wp->active_length = expected_length;
-    wp->ticks_per_trigger = (int)(12.0f * expected_length + 0.5f);
-    if (wp->ticks_per_trigger < 1) wp->ticks_per_trigger = 1;
 
     uint32_t slice_size = wp->total_frames / 8;
     for (int i = 0; i < 8; i++) {
@@ -584,6 +593,7 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     bb->main_length = 1.0f;
     bb->alt_length = 1.0f;
     bb->current_loop = 'A';
+    bb->pending_loop = 'A';
     strcpy(bb->status_str, "A_0_1x");
     bb->sample_counter = 0;
     bb->trigger_phase = 0.0f;
@@ -672,6 +682,17 @@ static void bb_reset_transport(breakbeat_t *bb) {
     bb->last_trigger_sample = bb->sample_counter;
     bb->trigger_phase = 0.0f;
     bb->bar_phase     = 0.0f;
+    /* For phrase=2, bar_in_phrase=phrase_bars-2=0 is never hit as a real bar
+     * boundary (bar_counter starts at 0 and first boundary makes it 1).
+     * Pre-schedule B here so it loads correctly at bar 1. */
+    bb->pending_sample_path[0] = '\0';
+    if (bb->phrase_bars == 2 && bb->alt_sample_path[0] &&
+        (float)rand() / (float)RAND_MAX < bb->swap_prob) {
+        snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
+                 "%s", bb->alt_sample_path);
+        bb->pending_main_length = bb->alt_length;
+        bb->pending_loop = 'B';
+    }
     bb->dbg_last_trigger_sample = bb->sample_counter;
     bb->dbg_triggers_to_log = 10;
     srand((unsigned int)(time(NULL) ^ bb->sample_counter));
@@ -1380,24 +1401,39 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
             bb->pending_bar = 0;
             bb->bar_counter++;
             if (bb->pending_sample_path[0]) {
+                /* Apply the queued sample and snap to slice 0 immediately.
+                 * current_loop is updated from pending_loop HERE (not when
+                 * scheduled) so the status never shows the next loop early.
+                 * pending_trigger is cleared because the bar-boundary tick fires
+                 * simultaneously and would otherwise overwrite play_pos. */
+                bb->current_loop = bb->pending_loop;
                 apply_sample_path(bb, bb->pending_sample_path, bb->pending_main_length);
                 bb->pending_sample_path[0] = '\0';
+                bb->current_slice = 0;
+                bb->play_pos      = (float)bb->slice_starts[0];
                 bb->trigger_count = 1;
+                bb->pending_trigger = 0;
+                bb->sub_slice_active  = 0;
+                bb->sub_slice_counter = 0;
+                snprintf(bb->status_str, sizeof(bb->status_str),
+                         "%c_0_1x", bb->current_loop);
             }
             if (bb->phrase_bars > 0) {
                 int bar_in_phrase = bb->bar_counter % bb->phrase_bars;
-                if (bar_in_phrase == bb->phrase_bars - 1) {
-                    if ((float)rand() / (float)RAND_MAX < bb->swap_prob) {
+                /* Schedule B two bars before the end (loads on last bar).
+                 * Schedule A return on the last bar (loads on first bar of next phrase). */
+                if (bar_in_phrase == bb->phrase_bars - 2) {
+                    if ((float)rand() / (float)RAND_MAX < bb->swap_prob && bb->alt_sample_path[0]) {
                         snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
                                  "%s", bb->alt_sample_path);
                         bb->pending_main_length = bb->alt_length;
-                        bb->current_loop = 'B';
+                        bb->pending_loop = 'B';
                     }
-                } else if (bar_in_phrase == 0 && bb->bar_counter > 0) {
+                } else if (bar_in_phrase == bb->phrase_bars - 1) {
                     snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
                              "%s", bb->main_sample_path);
                     bb->pending_main_length = bb->main_length;
-                    bb->current_loop = 'A';
+                    bb->pending_loop = 'A';
                 }
             }
         }
@@ -1409,10 +1445,17 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
             bb->bar_phase -= spb;
             bb->bar_counter++;
             if (bb->pending_sample_path[0]) {
+                bb->current_loop = bb->pending_loop;
                 apply_sample_path(bb, bb->pending_sample_path, bb->pending_main_length);
                 bb->pending_sample_path[0] = '\0';
                 bb->trigger_phase = 0.0f;
+                bb->current_slice = 0;
+                bb->play_pos      = (float)bb->slice_starts[0];
                 bb->trigger_count = 1;
+                bb->sub_slice_active  = 0;
+                bb->sub_slice_counter = 0;
+                snprintf(bb->status_str, sizeof(bb->status_str),
+                         "%c_0_1x", bb->current_loop);
             }
             if (bb->phrase_bars > 0) {
                 int bar_in_phrase = bb->bar_counter % bb->phrase_bars;
@@ -1421,13 +1464,13 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
                         snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
                                  "%s", bb->alt_sample_path);
                         bb->pending_main_length = bb->alt_length;
-                        bb->current_loop = 'B';
+                        bb->pending_loop = 'B';
                     }
                 } else if (bar_in_phrase == 0 && bb->bar_counter > 0) {
                     snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
                              "%s", bb->main_sample_path);
                     bb->pending_main_length = bb->main_length;
-                    bb->current_loop = 'A';
+                    bb->pending_loop = 'A';
                 }
             }
         }

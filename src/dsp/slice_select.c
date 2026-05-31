@@ -44,10 +44,13 @@ int slice_select_next(const slice_inputs_t *in, slice_rand_fn rand_fn, void *ran
             if (j > 7) j = 7;
             return j;
         }
-        if (rand_fn(rand_ctx) < eff_anchor) {
-            return in->beat_position;
-        }
-        return (in->current_slice + 1) & 7;
+        /* No swap: play the natural slice for this beat.
+         * Using beat_position rather than (current_slice+1) ensures that a
+         * random swap only affects the one beat it lands on. With current_slice+1,
+         * a swap at beat 5 → slice 2 would cause beats 6,7,0,1... to play
+         * slices 3,4,5,6... — permanent drift until another swap corrected it.
+         * Anchor still modulates the swap probability via the weight function. */
+        return in->beat_position;
     }
     /* STAY branch */
     if (rand_fn(rand_ctx) < SLICE_SELECT_ESCAPE_P) {

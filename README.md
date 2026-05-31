@@ -53,8 +53,12 @@ On top of the generative engine there's a **live performance layer**: momentary
 MIDI notes that override the engine while held. Send the module MIDI notes (from
 the Move pads, an external controller, or a sequencer) — note-on engages an
 effect, note-off releases it. Nothing latches: release everything and the
-generative engine seamlessly resumes on the next tick. While any pad is held, a
-**LIVE** overlay on the screen shows what's sounding (e.g. `A:3 .5x REV`).
+generative engine seamlessly resumes on the next tick.
+
+> The DSP exposes the live state via the read-only `perf_status` param (e.g.
+> `A:3 .5x REV` while held, empty otherwise). An on-screen overlay that surfaces
+> this in the Signal Chain view is deferred — the chain/shadow UI is drawn by the
+> host, so it needs a host-side hook rather than the module's own `ui.js`.
 
 > **Note range note:** the map below is the module's *raw MIDI note* assignment
 > (base note 36, +8 per row). How the Move's physical pads map onto these notes
@@ -196,8 +200,9 @@ ssh-keygen -R move.local
 - **Momentary MIDI-pad performance system.** Slice pads (notes 36–59) and macro
   pads (60–67) override the generative engine while held; release to resume. See
   the [MIDI map](#midi-map) above.
-- **Live overlay.** A `LIVE` box shows the held slice and active macros (e.g.
-  `A:3 .5x REV`) while you're playing, hidden when you're not.
+- **Live state readout.** The `perf_status` param reports the held slice and
+  active macros (e.g. `A:3 .5x REV`). A Signal-Chain on-screen overlay for this
+  is deferred (needs a host-side hook).
 - **½×/2× are true half/double speed**, not just pitch: ½× re-triggers the slice
   every other beat (plays twice as long), 2× re-triggers within the beat.
 - **No stuck notes.** Repeated note-ons for the same slice dedupe to one held

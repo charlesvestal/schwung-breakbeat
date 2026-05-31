@@ -1233,11 +1233,18 @@ static int bb_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "0");
     }
     else if (strcmp(key, "status") == 0) {
+        /* While a performance pad/macro is held, show the live readout (e.g.
+         * "A:3 .5x REV") in the visible Status param; otherwise fall back to the
+         * engine's own status (e.g. "A_3_1x"). get_param is polled live, so this
+         * updates in real time without any host-side overlay. */
+        int n = bb_perf_status_str(&bb->perf, bb->current_slice,
+                                   bb->current_loop, buf, buf_len);
+        if (n > 0) return n;
         return snprintf(buf, buf_len, "%s", bb->status_str);
     }
     else if (strcmp(key, "perf_status") == 0) {
-        /* Live overlay readout: held slice + active macros, or "" when the
-         * user is not manually triggering anything (so the UI hides it). */
+        /* Same live readout under its own key, for a future host-side overlay;
+         * "" when nothing is being manually triggered. */
         return bb_perf_status_str(&bb->perf, bb->current_slice,
                                   bb->current_loop, buf, buf_len);
     }

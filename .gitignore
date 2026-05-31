@@ -8,3 +8,5 @@ dist/
 /tests/test_slice_select
 /tests/test_perf
 /tests/test_ramp_gen
+
+.DS_Store

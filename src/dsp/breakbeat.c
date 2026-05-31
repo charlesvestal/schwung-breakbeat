@@ -900,6 +900,13 @@ static void bb_on_midi(void *instance, const uint8_t *msg, int len, int source) 
              * pending clock trigger so the next tick doesn't fight the jump.
              * Rate-related behavior stays locked to the clock in render_block. */
             int hit_bank = (bb->samples[bank].data) ? bank : bb->engine_bank;
+            {
+                char dbg[96];
+                snprintf(dbg, sizeof(dbg),
+                    "breakbeat: PAD note=%d slice=%d req_bank=%d hit_bank=%d Bframes=%u",
+                    note, slice, bank, hit_bank, bb->samples[1].total_frames);
+                wp_log(dbg);
+            }
             bb->render_bank       = hit_bank;
             bb->current_slice     = slice;
             bb->play_pos          = (float)bb->samples[hit_bank].slice_starts[slice];
@@ -1556,9 +1563,11 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
                       : bb->stable_bpm;
         char hbbuf[128];
         snprintf(hbbuf, sizeof(hbbuf),
-                 "breakbeat: heartbeat bpm=%.1f loop=%c slice=%d ticks=%s",
+                 "breakbeat: heartbeat bpm=%.1f loop=%c slice=%d ticks=%s eng=%d rend=%d held=%d Af=%u Bf=%u",
                  dbg_bpm, bb->current_loop, bb->current_slice,
-                 tick_mode ? "yes" : "no");
+                 tick_mode ? "yes" : "no",
+                 bb->engine_bank, bb->render_bank, bb->perf.slice_count,
+                 bb->samples[0].total_frames, bb->samples[1].total_frames);
         wp_log(hbbuf);
     }
 

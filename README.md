@@ -17,23 +17,27 @@ Demo: https://www.youtube.com/watch?v=vYf1vPt3pMc
 
 | Knob | Range | What it does |
 |---|---|---|
-| **Complexity** | 0–100 | Probability that any given trigger picks a *random* slice instead of advancing in order. At 0, slices follow either Anchor (if engaged) or sequential advance. At 100, every non-stay trigger rolls a fresh random slice. |
-| **Anchor** | 0–100 | Locks slice index to *beat position* in the bar. At 0, behavior matches the original module (sequential advance with random swaps). At 100, the no-swap fallback forces `slice = beat_position` — kick lands on every beat 1, snare lands on every beat 3. The locked weight curve also makes lock-zone slices unswappable: at high Anchor, beats 1 and 3 *never* get swapped out by Complexity. |
+| **Complexity** | 0–100 | Probability that any given trigger picks a *random* slice instead of advancing in order. At 0, slices follow beat position (or Anchor if engaged). At 100, every non-stay trigger rolls a fresh random slice. |
+| **Anchor** | 0–100 | Locks slice index to *beat position* in the bar. At 0, behavior is sequential advance with Complexity-driven random swaps. At 100, beats 1 and 3 (kick/snare) are protected from swaps and the no-swap fallback snaps to `beat_position`. |
 | **Roll** | 0–100 | Temporal stickiness. At 0, every trigger is independent. At 100, most triggers either repeat the current slice, walk to the ±1 neighbor, or take a 5% escape-hatch jump. Produces the rolling jungle "1 2 3 1 2 3 4 5" feel and held-slice stutters. |
-| **Fill** | 0–100 | Intensity of the *fill bar* modulation. Only meaningful when **Phrase** is non-Off. Modulates Complexity ↑, Roll ↓, Anchor ↓ on the last bar of every phrase. At 0, fill bars play normally. At 100, the fill bar throws out the groove rules entirely. |
-| **Retrigger** | 0–100 | Probability that any given trigger sub-divides the slice for a stutter repeat. |
+| **Fill** | 0–100 | Intensity of the *fill bar* modulation. Only meaningful when **Phrase** is non-Off. Modulates Complexity ↑, Roll ↓, Anchor ↓ on the last bar of every phrase. At 100, the fill bar throws out the groove rules entirely. |
+| **Retrig 2x** | 0–100 | Per-bar probability of a 2x (half-slice) stutter on any given beat. |
+| **Retrig 3x** | 0–100 | Per-bar probability of a 3x stutter. |
+| **Retrig 4x** | 0–100 | Per-bar probability of a 4x stutter. |
+| **Retrig 8x** | 0–100 | Per-bar probability of an 8x (16th-note micro-stutter) on any given beat. |
+
+All four retrigger knobs are independent — any combination can be active at once. If multiple rates roll true on the same beat, one is chosen at random. 100% on any knob guarantees that rate fires on every beat; values represent true per-bar odds regardless of loop length.
 
 ### Settings (configure once, leave alone)
 
 | Setting | Values | What it does |
 |---|---|---|
-| **A Sample** | filepath | Selects which WAV to slice. Opens file browser. |
+| **A Sample** | filepath | Selects which WAV to slice. Opens file browser rooted at `/data/UserData/breakbeat-samples`, which contains a `Built-in/` folder and a `User Library/` symlink to your device's sample library. |
 | **A Length** | enum | Trigger interval for A loop (1/4 bar to 8 bars). |
 | **B Sample** | filepath | Selects the loop used for phrase fills. |
 | **B Length** | enum | Trigger interval for B loop (1/4 bar to 8 bars). |
 | **B Chance** | 0–100 | Probability of swapping to B Loop on the last bar of a phrase. |
 | **Phrase** | enum | Multi-bar phrase length (Off, 2, 4, 8, 16 bars). |
-| **Retrig Rate** | enum | Sub-divisions per retrigger event (2x, 3x, 4x, 8x, Rand). |
 
 ### Meta
 
@@ -62,7 +66,7 @@ Each trigger tick:
 3. **Move branch:**
    - Compute swap probability: `p_swap = Complexity * weight_at(beat_position, Anchor)`
    - If we swap → uniform random slice 0..7
-   - Else → with probability **Anchor**, snap to `beat_position`; otherwise sequential advance from current slice
+   - Else → play `beat_position` (the natural slice for this beat)
 4. **Stay branch:**
    - 5% escape hatch: jump 2..4 forward
    - Otherwise: with probability `(1 - weight_at(current_slice, Anchor))` repeat current; else walk ±1
@@ -140,10 +144,20 @@ ssh-keygen -R move.local
 
 ## Changelog
 
-### Startup fixes
-- **Module now loads the `1_calm` preset immediately on startup.** Previously the module tried to load a hardcoded `amen.wav` path that doesn't exist, leaving `bb->data = NULL` and producing silence until the user changed a preset or muted/unmuted the slot.
-- **Preset list is now sorted alphabetically** after scanning, so index 0 is always `1_calm` regardless of filesystem order.
-- **State restore now applies the sample immediately** when the transport is stopped, instead of deferring it to the next MIDI clock bar boundary (which might never arrive on a fresh load).
+### v0.4.0
+- **Multi-rate retrigger.** Replaced the single Retrigger + Retrig Rate pair with four independent per-bar probability knobs (Retrig 2x / 3x / 4x / 8x). Any combination can be active simultaneously; if multiple rates fire on the same beat one is chosen at random. Probabilities are normalised correctly using the inverse binomial formula so 100% guarantees the rate fires on every beat and 5% means roughly 5% of bars. Old presets migrate automatically.
+- **Sample preview.** Changing A Sample or Preset while transport is stopped now plays one full loop of the selected break immediately, using the current tempo knob value for rate. Lets you audition samples from the file browser without starting the transport.
+- **User sample library access.** The A/B Sample file browser now exposes a `User Library/` folder alongside `Built-in/`, linked to `/data/UserData/UserLibrary/Samples`.
+- **Tick-based timing rewrite.** Slice triggers now fire directly from MIDI 0xF8 clock ticks rather than a BPM phase accumulator. Playback rate is measured from the actual sample-counter distance between ticks — no BPM math, no drift. Falls back to the Move tempo-knob BPM when MIDI clock is unavailable.
+- **Phrase-2 pre-scheduling fix.** For 2-bar phrases, B was never scheduled because the `bar_in_phrase == 0` boundary is never reached during normal playback. Fixed by pre-scheduling at transport reset.
+- **Slice drift fix.** The no-swap branch now returns `beat_position` rather than `(current_slice+1) & 7`, preventing a random swap from permanently drifting all subsequent beats off-grid.
+- **Retrigger bleed fix.** A mid-flight retrigger on the last beat of a bar no longer carries into the first beat of the incoming sample when a phrase swap occurs.
 
-### Sample-swap stability fix
-- **Added `madvise(MADV_WILLNEED)` after every `mmap` call in `open_wav`.** Without this, the kernel loads WAV pages lazily — the first time `render_block` touches a freshly-loaded sample it triggers OS page faults on the audio thread, causing latency spikes that trip Schwung's render watchdog and kill the module. This was most noticeable when the phrase engine swapped to the B sample mid-performance (e.g. ramping tempo through a phrase boundary). Pre-faulting happens in the MIDI callback, well before the audio thread needs the data.
+### v0.3.3
+- Added diagnostic logging; renamed module display name to Breakbeat.
+
+### v0.3.2
+- **Module now loads the `1_calm` preset immediately on startup** instead of a missing hardcoded path.
+- **Preset list sorted alphabetically** so index 0 is always `1_calm`.
+- **State restore applies sample immediately** when transport is stopped.
+- **Added `madvise(MADV_WILLNEED)`** after every `mmap` to pre-fault WAV pages before the audio thread touches them, preventing render-watchdog kills on sample swap.

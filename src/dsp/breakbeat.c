@@ -10,14 +10,31 @@
 #include <dirent.h>
 #include "plugin_api_v1.h"
 #include "slice_select.h"
+#include "bb_timing.h"
 #include <time.h>
 #include <math.h>
+#include <stdatomic.h>
+#include <sched.h>
 
 /* WAV audio format codes */
 #define WAV_FORMAT_PCM   1
 #define WAV_FORMAT_FLOAT 3
 
 #define BB_PATH_MAX 512
+
+typedef struct {
+    int fd;
+    void *map;
+    size_t map_size;
+    void *data;
+    uint32_t total_frames;
+    int num_channels;
+    int audio_format;
+    int bits_per_sample;
+    uint32_t slice_starts[8];
+    uint32_t slice_lengths[8];
+    float musical_length;
+} bb_sample_slot_t;
 
 typedef struct {
     int preset_idx;
@@ -56,6 +73,7 @@ typedef struct {
     int sub_slice_counter;
     int retrigger_divisions;
     int preview_frames;       /* >0 = play preview even while transport stopped */
+    int suppress_next_preset_preview; /* first host preset assignment is restore */
 
     uint64_t sample_counter;
 
@@ -78,8 +96,7 @@ typedef struct {
      * transport is stopped but may drift slightly while running.
      */
     int      ticks_per_trigger;    /* 0xF8 ticks between slice triggers (12 × active_length) */
-    int      midi_tick;            /* ticks since last 0xFA; resets every 96 ticks (1 bar) */
-    int      fa_received;          /* set by on_midi(0xFA); cleared by the T_run handler */
+    bb_timing_t timing;            /* authoritative Start/Stop + 24 PPQN phase */
 
     /* Pending events set from on_midi(), applied at the top of render_block(). */
     int      pending_trigger;      /* 1 = a trigger arrived since last render block */
@@ -120,6 +137,20 @@ typedef struct {
     char current_loop;   /* loop actually playing right now ('A' or 'B') */
     char pending_loop;   /* loop that will play when pending_sample_path loads */
     char status_str[32];
+
+    uint32_t rng_state;  /* per-instance xorshift PRNG; never takes libc rand() locks */
+
+    /* The inactive A/B sample stays mapped so phrase transitions only swap
+     * in-memory metadata. No file operation is permitted in render_block. */
+    bb_sample_slot_t standby_sample;
+    char standby_loop;
+    int pending_sample_switch;
+
+    /* Non-blocking reader gate. Parameter changes may replace the active map
+     * from a control thread; render never waits and emits silence while the
+     * control thread waits for any in-flight block to finish. */
+    atomic_int sample_update;
+    atomic_int sample_readers;
 
     /* Diagnostics — log key events once rather than every block. */
     int dbg_first_render;     /* 1 until first render_block call is logged */
@@ -176,9 +207,30 @@ static void scan_presets(const char *module_dir) {
     wp_log(dbg);
 }
 
+static uint32_t bb_random_u32(breakbeat_t *bb) {
+    uint32_t x = bb->rng_state;
+    if (x == 0) x = 0x9e3779b9u;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    bb->rng_state = x;
+    return x;
+}
+
 static float bb_rand(void *ctx) {
-    (void)ctx;
-    return (float)rand() / (float)RAND_MAX;
+    breakbeat_t *bb = (breakbeat_t *)ctx;
+    return (float)(bb_random_u32(bb) & 0x00ffffffu) / 16777216.0f;
+}
+
+static void bb_update_status(breakbeat_t *bb) {
+    int div = bb->sub_slice_active ? bb->retrigger_divisions : 1;
+    bb->status_str[0] = bb->current_loop;
+    bb->status_str[1] = '_';
+    bb->status_str[2] = (char)('0' + (bb->current_slice & 7));
+    bb->status_str[3] = '_';
+    bb->status_str[4] = (char)('0' + div);
+    bb->status_str[5] = 'x';
+    bb->status_str[6] = '\0';
 }
 
 /* JSON helpers for state parsing */
@@ -264,6 +316,14 @@ static void close_file(breakbeat_t *wp) {
     wp->playing = 0;
 }
 
+static void close_sample_slot(bb_sample_slot_t *slot) {
+    if (!slot) return;
+    if (slot->map && slot->map != MAP_FAILED) munmap(slot->map, slot->map_size);
+    if (slot->fd >= 0) close(slot->fd);
+    memset(slot, 0, sizeof(*slot));
+    slot->fd = -1;
+}
+
 /* True if extension (case-insensitive) matches .wav */
 static int has_wav_ext(const char *path) {
     if (!path) return 0;
@@ -279,6 +339,7 @@ static int has_wav_ext(const char *path) {
 /* Resolve possibly-relative `path` against `module_dir` into `out`.
  * Absolute paths copy as-is; relative paths get prefixed with module_dir. */
 static void resolve_sample_path(const char *module_dir, const char *path, char *out, size_t out_len) {
+    (void)module_dir;
     if (!path || !path[0]) { if (out_len > 0) out[0] = '\0'; return; }
     if (path[0] == '/') {
         snprintf(out, out_len, "%s", path);
@@ -291,16 +352,6 @@ static void resolve_sample_path(const char *module_dir, const char *path, char *
 #define BB_USER_LIB_TARGET "/data/UserData/UserLibrary/Samples"
 #define BB_BUILTIN_LINK    BB_PORTAL_DIR "/Built-in"
 #define BB_USER_LIB_LINK   BB_PORTAL_DIR "/User Library"
-
-/* Returns the directory part of a sample path, or BB_PORTAL_DIR as fallback. */
-static void sample_dirname(const char *path, char *dir, size_t dir_len) {
-    const char *slash = (path && path[0]) ? strrchr(path, '/') : NULL;
-    if (!slash || slash == path) { snprintf(dir, dir_len, "%s", BB_PORTAL_DIR); return; }
-    size_t n = (size_t)(slash - path);
-    if (n >= dir_len) n = dir_len - 1;
-    memcpy(dir, path, n);
-    dir[n] = '\0';
-}
 
 static void build_ui_hierarchy(const breakbeat_t *bb, char *out, int out_len) {
     (void)bb;
@@ -528,6 +579,88 @@ static int open_wav(breakbeat_t *wp, const char *path, float expected_length) {
     return 0;
 }
 
+/* Load the non-playing A/B sample from a control-thread call. open_wav is
+ * reused for validation, then ownership of the map moves into standby_sample. */
+static int load_standby_sample(breakbeat_t *bb, const char *path, float expected_length) {
+    if (!bb || !path || !path[0] || !has_wav_ext(path)) return -1;
+
+    char resolved[BB_PATH_MAX * 2];
+    resolve_sample_path(bb->module_dir, path, resolved, sizeof(resolved));
+
+    breakbeat_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.fd = -1;
+    tmp.ticks_per_trigger = 12;
+    if (open_wav(&tmp, resolved, expected_length) != 0) return -1;
+
+    close_sample_slot(&bb->standby_sample);
+    bb->standby_sample.fd = tmp.fd;
+    bb->standby_sample.map = tmp.map;
+    bb->standby_sample.map_size = tmp.map_size;
+    bb->standby_sample.data = tmp.data;
+    bb->standby_sample.total_frames = tmp.total_frames;
+    bb->standby_sample.num_channels = tmp.num_channels;
+    bb->standby_sample.audio_format = tmp.audio_format;
+    bb->standby_sample.bits_per_sample = tmp.bits_per_sample;
+    memcpy(bb->standby_sample.slice_starts, tmp.slice_starts, sizeof(tmp.slice_starts));
+    memcpy(bb->standby_sample.slice_lengths, tmp.slice_lengths, sizeof(tmp.slice_lengths));
+    bb->standby_sample.musical_length = expected_length;
+
+    /* Ownership moved; prevent tmp cleanup from touching the map. */
+    tmp.fd = -1;
+    tmp.map = NULL;
+    return 0;
+}
+
+/* Swap active and standby sample ownership. This function performs no I/O,
+ * allocation, locking, logging, or formatting and is safe at a bar boundary. */
+static int activate_standby_sample(breakbeat_t *bb) {
+    bb_sample_slot_t *s = &bb->standby_sample;
+    if (!s->data || s->total_frames == 0) return -1;
+
+    int old_fd = bb->fd;
+    void *old_map = bb->map;
+    size_t old_map_size = bb->map_size;
+    void *old_data = bb->data;
+    uint32_t old_total_frames = bb->total_frames;
+    int old_channels = bb->num_channels;
+    int old_format = bb->audio_format;
+    int old_bits = bb->bits_per_sample;
+    uint32_t old_starts[8], old_lengths[8];
+    memcpy(old_starts, bb->slice_starts, sizeof(old_starts));
+    memcpy(old_lengths, bb->slice_lengths, sizeof(old_lengths));
+    float old_musical_length = bb->active_length;
+
+    bb->fd = s->fd;
+    bb->map = s->map;
+    bb->map_size = s->map_size;
+    bb->data = s->data;
+    bb->total_frames = s->total_frames;
+    bb->num_channels = s->num_channels;
+    bb->audio_format = s->audio_format;
+    bb->bits_per_sample = s->bits_per_sample;
+    memcpy(bb->slice_starts, s->slice_starts, sizeof(bb->slice_starts));
+    memcpy(bb->slice_lengths, s->slice_lengths, sizeof(bb->slice_lengths));
+    bb->active_length = s->musical_length;
+
+    s->fd = old_fd;
+    s->map = old_map;
+    s->map_size = old_map_size;
+    s->data = old_data;
+    s->total_frames = old_total_frames;
+    s->num_channels = old_channels;
+    s->audio_format = old_format;
+    s->bits_per_sample = old_bits;
+    memcpy(s->slice_starts, old_starts, sizeof(s->slice_starts));
+    memcpy(s->slice_lengths, old_lengths, sizeof(s->slice_lengths));
+    s->musical_length = old_musical_length;
+
+    bb->ticks_per_trigger = (int)(12.0f * bb->active_length + 0.5f);
+    if (bb->ticks_per_trigger < 1) bb->ticks_per_trigger = 1;
+    bb->play_pos = (float)bb->slice_starts[0];
+    return 0;
+}
+
 /* Load the sample at `path` (relative or absolute). Returns 0 on success. */
 static int apply_sample_path(breakbeat_t *bb, const char *path, float expected_length) {
     if (!bb || !path || !path[0]) return -1;
@@ -544,7 +677,12 @@ static int apply_sample_path(breakbeat_t *bb, const char *path, float expected_l
     snprintf(log_buf, sizeof(log_buf), "breakbeat: applying sample %s", resolved);
     wp_log(log_buf);
 
-    return open_wav(bb, resolved, expected_length);
+    atomic_store_explicit(&bb->sample_update, 1, memory_order_release);
+    while (atomic_load_explicit(&bb->sample_readers, memory_order_acquire) > 0)
+        sched_yield();
+    int result = open_wav(bb, resolved, expected_length);
+    atomic_store_explicit(&bb->sample_update, 0, memory_order_release);
+    return result;
 }
 
 
@@ -649,7 +787,10 @@ static void load_preset_idx(breakbeat_t *bb, int idx) {
     free(json);
 
     apply_sample_path(bb, bb->main_sample_path, bb->main_length);
+    if (load_standby_sample(bb, bb->alt_sample_path, bb->alt_length) == 0)
+        bb->standby_loop = 'B';
     bb->pending_sample_path[0] = '\0';
+    bb->pending_sample_switch = 0;
 }
 
 static void* bb_create_instance(const char *module_dir, const char *json_defaults) {
@@ -663,11 +804,14 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     bb->sub_slice_counter = 0;
     bb->retrigger_divisions = 2;
     bb->preview_frames = 0;
+    bb->suppress_next_preset_preview = 1;
     bb->length = 1.0f;
     bb->main_length = 1.0f;
     bb->alt_length = 1.0f;
     bb->current_loop = 'A';
     bb->pending_loop = 'A';
+    bb->standby_loop = 'B';
+    bb->pending_sample_switch = 0;
     strcpy(bb->status_str, "A_0_1x");
     bb->sample_counter = 0;
     bb->trigger_phase = 0.0f;
@@ -677,8 +821,7 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     bb->pending_main_length = 1.0f;
     bb->was_running = 0;
     bb->ticks_per_trigger  = 12;   /* 1-bar default; updated when active_length changes */
-    bb->midi_tick          = 0;
-    bb->fa_received        = 0;
+    bb_timing_init(&bb->timing);
     bb->pending_trigger    = 0;
     bb->pending_beat_pos   = 0;
     bb->pending_bar        = 0;
@@ -697,10 +840,26 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     bb->bar_counter = 0;
     bb->reseed_pending = 0;
     bb->fd = -1;
+    bb->standby_sample.fd = -1;
+    atomic_init(&bb->sample_update, 0);
+    atomic_init(&bb->sample_readers, 0);
     bb->dbg_first_render = 1;
     bb->dbg_silence_reason = 0;
     bb->dbg_last_clock_status = -1;
     bb->dbg_last_heartbeat = 0;
+    bb->rng_state = (uint32_t)time(NULL) ^ (uint32_t)(uintptr_t)bb;
+
+    /* Seed the stored tempo from the Set itself, never from a live clock
+     * estimate. The render path keeps this value current if the user changes
+     * the Move tempo after the module has been instantiated. */
+    if (g_host && g_host->get_project_bpm) {
+        float bpm = g_host->get_project_bpm();
+        if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
+    }
+    if (bb->stable_bpm < 20.0f && g_host && g_host->get_bpm) {
+        float bpm = g_host->get_bpm();
+        if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
+    }
 
     /* Capture module_dir for relative-path resolution. */
     if (module_dir && module_dir[0]) {
@@ -737,6 +896,7 @@ static void bb_destroy_instance(void *instance) {
     breakbeat_t *bb = (breakbeat_t *)instance;
     if (!bb) return;
     close_file(bb);
+    close_sample_slot(&bb->standby_sample);
     free(bb);
     if (g_host && g_host->log) g_host->log("breakbeat: instance destroyed");
 }
@@ -755,6 +915,15 @@ static void bb_start_preview(breakbeat_t *bb) {
 }
 
 static void bb_reset_transport(breakbeat_t *bb) {
+    /* Every new song run starts with A, even if Stop arrived during the B
+     * fill. Both samples are resident, so this metadata swap is RT-safe. */
+    if (bb->current_loop != 'A' && bb->standby_loop == 'A') {
+        char old_loop = bb->current_loop;
+        if (activate_standby_sample(bb) == 0) {
+            bb->current_loop = 'A';
+            bb->standby_loop = old_loop;
+        }
+    }
     bb->trigger_count     = 0;
     bb->bar_counter       = 0;
     bb->current_slice     = 0;
@@ -762,78 +931,49 @@ static void bb_reset_transport(breakbeat_t *bb) {
     bb->sub_slice_counter = 0;
     bb->just_reset        = 1;
     bb->bpm_low_count     = 0;
-    bb->midi_tick         = 0;   /* tick count starts fresh from this 0xFA */
-    bb->fa_received       = 1;   /* tells the T_run handler to use tick-based offset */
     bb->pending_trigger   = 0;
     bb->pending_bar       = 0;
     bb->last_trigger_sample = bb->sample_counter;
     bb->trigger_phase = 0.0f;
     bb->bar_phase     = 0.0f;
+    bb->was_running = 1;
     /* For phrase=2, bar_in_phrase=phrase_bars-2=0 is never hit as a real bar
      * boundary (bar_counter starts at 0 and first boundary makes it 1).
      * Pre-schedule B here so it loads correctly at bar 1. */
     bb->pending_sample_path[0] = '\0';
+    bb->pending_sample_switch = 0;
     if (bb->phrase_bars == 2 && bb->alt_sample_path[0] &&
-        (float)rand() / (float)RAND_MAX < bb->swap_prob) {
-        snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
-                 "%s", bb->alt_sample_path);
-        bb->pending_main_length = bb->alt_length;
+        bb->standby_loop == 'B' && bb_rand(bb) < bb->swap_prob) {
+        bb->pending_sample_switch = 1;
         bb->pending_loop = 'B';
     }
-    bb->dbg_last_trigger_sample = bb->sample_counter;
-    bb->dbg_triggers_to_log = 10;
-    srand((unsigned int)(time(NULL) ^ bb->sample_counter));
-    wp_log("breakbeat: transport reset");
+    bb->preview_frames = 0;
+    bb_update_status(bb);
 }
 
 static void bb_on_midi(void *instance, const uint8_t *msg, int len, int source) {
     breakbeat_t *bb = (breakbeat_t *)instance;
+    (void)source;
     if (!bb || len < 1) return;
 
-    /* Transport start / continue — reset phase so slice 0 lands on beat 1. */
-    if (msg[0] == 0xFA || msg[0] == 0xFB) {
-        bb_reset_transport(bb);
-        return;
-    }
-
-    /* 0xF8 MIDI clock tick — fire triggers directly from the clock.
-     *
-     * Rather than measuring BPM and deriving a rate, we simply fire a slice
-     * trigger every ticks_per_trigger ticks. The playback rate is then measured
-     * from the actual sample-counter distance between triggers, which is inherently
-     * correct with no calculation, no filter, and no startup jitter.
-     *
-     * Only arrives when MIDI Sync = Out is configured on the device.
-     * When unavailable the phase-accumulator fallback runs in render_block. */
-    if (msg[0] == 0xF8) {
-        bb->midi_tick++;
-
-        /* Slice trigger. */
-        if (bb->ticks_per_trigger > 0 &&
-            bb->midi_tick % bb->ticks_per_trigger == 0) {
-
-            uint64_t now = bb->sample_counter;
-            /* Measure the inter-trigger interval for rate calculation.
-             * Sanity: at 30 BPM with 8-bar length, max interval ≈ 2.8M samples.
-             * At 300 BPM with 1/4-bar length, min interval ≈ 1100 samples. */
-            if (bb->last_trigger_sample > 0) {
-                uint64_t elapsed = now - bb->last_trigger_sample;
-                if (elapsed >= 1100 && elapsed <= 2822400)
-                    bb->samples_per_trigger = (float)elapsed;
-            }
-            bb->last_trigger_sample = now;
-
-            bb->pending_beat_pos = bb->trigger_count % 8;
-            bb->trigger_count++;
-            bb->pending_trigger  = 1;
+    if (msg[0] >= 0xF8) {
+        int beat_position = 0;
+        int events = bb_timing_on_realtime(&bb->timing, msg[0],
+                                            bb->ticks_per_trigger,
+                                            &beat_position);
+        if (events & BB_TIMING_START) bb_reset_transport(bb);
+        if (events & BB_TIMING_STOP) {
+            bb->was_running = 0;
+            bb->pending_trigger = 0;
+            bb->pending_bar = 0;
+            bb->preview_frames = 0;
+            bb->sub_slice_active = 0;
         }
-
-        /* Bar boundary every 96 ticks. */
-        if (bb->midi_tick >= 96) {
-            bb->midi_tick = 0;
-            bb->pending_bar = 1;
+        if (events & BB_TIMING_TRIGGER) {
+            bb->pending_beat_pos = beat_position;
+            bb->pending_trigger = 1;
         }
-
+        if (events & BB_TIMING_BAR) bb->pending_bar = 1;
         return;
     }
 
@@ -865,6 +1005,8 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
     }
     
     if (strcmp(key, "preset") == 0 || strcmp(key, "preset_index") == 0) {
+        int preview_allowed = !bb->suppress_next_preset_preview;
+        bb->suppress_next_preset_preview = 0;
         bb->preset_idx = atoi(val);
         
         char dbg[128];
@@ -892,12 +1034,14 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
 
         if (!is_running) {
             apply_sample_path(bb, bb->main_sample_path, bb->main_length);
+            if (load_standby_sample(bb, bb->alt_sample_path, bb->alt_length) == 0)
+                bb->standby_loop = 'B';
             bb->pending_sample_path[0] = '\0';
-            bb_start_preview(bb);
+            bb->pending_sample_switch = 0;
+            if (preview_allowed) bb_start_preview(bb);
+            else bb->preview_frames = 0;
         } else {
-            snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
-                     "%s", bb->main_sample_path);
-            bb->pending_main_length = bb->main_length;
+            wp_log("breakbeat: stop transport before changing presets");
         }
     }
     else if (strcmp(key, "A_sample_path") == 0) {
@@ -911,15 +1055,17 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         if (!is_running) {
             apply_sample_path(bb, bb->main_sample_path, bb->main_length);
             bb->pending_sample_path[0] = '\0';
+            bb->pending_sample_switch = 0;
             bb_start_preview(bb);
         } else {
-            snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
-                     "%s", bb->main_sample_path);
-            bb->pending_main_length = bb->main_length;
+            wp_log("breakbeat: stop transport before changing A Sample");
         }
     }
     else if (strcmp(key, "B_sample_path") == 0) {
         resolve_sample_path(bb->module_dir, val, bb->alt_sample_path, sizeof(bb->alt_sample_path));
+        if (!bb->timing.running &&
+            load_standby_sample(bb, bb->alt_sample_path, bb->alt_length) == 0)
+            bb->standby_loop = 'B';
     }
     else if (strcmp(key, "A_sample_length") == 0 || strcmp(key, "length") == 0) {
         int idx = atoi(val);
@@ -927,8 +1073,13 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         if (idx >= 0 && idx < 6) {
             bb->length = lengths[idx];
             bb->main_length = lengths[idx];
-            /* active_length only updates when the sample actually loads,
-             * so the rate stays correct until the bar boundary. */
+            if (!bb->timing.running && bb->current_loop == 'A') {
+                bb->active_length = bb->main_length;
+                bb->ticks_per_trigger = (int)(12.0f * bb->active_length + 0.5f);
+                if (bb->ticks_per_trigger < 1) bb->ticks_per_trigger = 1;
+            } else if (bb->standby_loop == 'A') {
+                bb->standby_sample.musical_length = bb->main_length;
+            }
         }
     }
     else if (strcmp(key, "B_sample_length") == 0 || strcmp(key, "alt_length") == 0) {
@@ -936,6 +1087,13 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         float lengths[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
         if (idx >= 0 && idx < 6) {
             bb->alt_length = lengths[idx];
+            if (!bb->timing.running && bb->current_loop == 'B') {
+                bb->active_length = bb->alt_length;
+                bb->ticks_per_trigger = (int)(12.0f * bb->active_length + 0.5f);
+                if (bb->ticks_per_trigger < 1) bb->ticks_per_trigger = 1;
+            } else if (bb->standby_loop == 'B') {
+                bb->standby_sample.musical_length = bb->alt_length;
+            }
         }
     }
     else if (strcmp(key, "complexity") == 0) {
@@ -1070,7 +1228,11 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         }
     }
     else if (strcmp(key, "state") == 0) {
-        json_get_int(val, "preset_index", &bb->preset_idx);
+        /* State restore is not a user audition. The chain host applies the
+         * preset immediately before state, so cancel any preview it started. */
+        bb->preview_frames = 0;
+        if (!json_get_int(val, "preset_index", &bb->preset_idx))
+            json_get_int(val, "preset", &bb->preset_idx); /* v0.4 compatibility */
         if (g_total_presets > 0) {
             if (bb->preset_idx < 0) bb->preset_idx = 0;
             if (bb->preset_idx >= g_total_presets) bb->preset_idx = g_total_presets - 1;
@@ -1094,7 +1256,14 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         int i;
         if (json_get_int(val, "length", &i)) {
             static const float lengths[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
-            if (i >= 0 && i < 6) bb->length = lengths[i];
+            if (i >= 0 && i < 6) {
+                bb->length = lengths[i];
+                bb->main_length = lengths[i];
+            }
+        }
+        if (json_get_int(val, "alt_length", &i)) {
+            static const float lengths[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
+            if (i >= 0 && i < 6) bb->alt_length = lengths[i];
         }
         if (json_get_int(val, "complexity", &i)) {
             bb->complexity = (float)i / 100.0f;
@@ -1141,7 +1310,10 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
                 is_running = (g_host->get_clock_status() == 2);
             if (!is_running) {
                 apply_sample_path(bb, bb->main_sample_path, bb->main_length);
+                if (load_standby_sample(bb, bb->alt_sample_path, bb->alt_length) == 0)
+                    bb->standby_loop = 'B';
                 bb->pending_sample_path[0] = '\0';
+                bb->pending_sample_switch = 0;
             }
         }
     }
@@ -1254,6 +1426,9 @@ static int bb_get_param(void *instance, const char *key, char *buf, int buf_len)
     else if (strcmp(key, "B_chance") == 0) {
         return snprintf(buf, buf_len, "%d", (int)(bb->swap_prob * 100.0f));
     }
+    else if (strcmp(key, "tempo_bpm") == 0) {
+        return snprintf(buf, buf_len, "%.3f", bb->stable_bpm);
+    }
     else if (strcmp(key, "state") == 0) {
         int len_idx = 2; // Default to 1.0
         if (bb->length == 0.25f) len_idx = 0;
@@ -1269,13 +1444,21 @@ static int bb_get_param(void *instance, const char *key, char *buf, int buf_len)
         else if (bb->phrase_bars == 8) phrase_idx = 3;
         else if (bb->phrase_bars == 16) phrase_idx = 4;
 
+        int alt_len_idx = 2;
+        if (bb->alt_length == 0.25f) alt_len_idx = 0;
+        else if (bb->alt_length == 0.5f) alt_len_idx = 1;
+        else if (bb->alt_length == 1.0f) alt_len_idx = 2;
+        else if (bb->alt_length == 2.0f) alt_len_idx = 3;
+        else if (bb->alt_length == 4.0f) alt_len_idx = 4;
+        else if (bb->alt_length == 8.0f) alt_len_idx = 5;
+
         return snprintf(buf, buf_len,
-            "{\"preset\":%d,\"sample_path\":\"%s\",\"alt_sample_path\":\"%s\","
-            "\"length\":%d,\"complexity\":%d,\"anchor\":%d,\"roll\":%d,\"phrase\":%d,\"fill\":%d,"
+            "{\"preset_index\":%d,\"sample_path\":\"%s\",\"alt_sample_path\":\"%s\","
+            "\"length\":%d,\"alt_length\":%d,\"complexity\":%d,\"anchor\":%d,\"roll\":%d,\"phrase\":%d,\"fill\":%d,"
             "\"retrig_2x\":%d,\"retrig_3x\":%d,\"retrig_4x\":%d,\"retrig_8x\":%d,\"swap_prob\":%d}",
             bb->preset_idx,
             bb->main_sample_path, bb->alt_sample_path,
-            len_idx,
+            len_idx, alt_len_idx,
             (int)(bb->complexity * 100.0f), (int)(bb->anchor * 100.0f),
             (int)(bb->roll * 100.0f), phrase_idx, (int)(bb->fill * 100.0f),
             (int)(bb->retrig_p[0] * 100.0f), (int)(bb->retrig_p[1] * 100.0f),
@@ -1286,132 +1469,100 @@ static int bb_get_param(void *instance, const char *key, char *buf, int buf_len)
     return -1;
 }
 
+static void bb_fire_trigger(breakbeat_t *bb, int beat_pos) {
+    slice_inputs_t in = {
+        .current_slice = bb->current_slice,
+        .beat_position = beat_pos,
+        .complexity = bb->complexity,
+        .anchor = bb->anchor,
+        .roll = bb->roll,
+        .phrase_bars = bb->phrase_bars,
+        .fill = bb->fill,
+        .bar_in_phrase = bb->phrase_bars > 0
+                       ? bb->bar_counter % bb->phrase_bars : 0,
+    };
+    bb->current_slice = (bb->complexity == 0.0f)
+                      ? beat_pos
+                      : slice_select_next(&in, bb_rand, bb);
+    bb->sub_slice_counter = 0;
+
+    static const int retrigger_divs[4] = {2, 3, 4, 8};
+    float triggers_per_bar = (bb->active_length > 0.0f)
+                           ? (8.0f / bb->active_length) : 8.0f;
+    float inv_triggers_per_bar = 1.0f / triggers_per_bar;
+    int fired[4];
+    int fired_count = 0;
+    for (int i = 0; i < 4; i++) {
+        float p_bar = bb->retrig_p[i];
+        if (p_bar <= 0.0f) continue;
+        float p_trigger = (p_bar >= 1.0f) ? 1.0f
+                        : 1.0f - powf(1.0f - p_bar, inv_triggers_per_bar);
+        if (bb_rand(bb) < p_trigger) fired[fired_count++] = i;
+    }
+    if (fired_count > 0) {
+        bb->sub_slice_active = 1;
+        int selected = fired[bb_random_u32(bb) % (uint32_t)fired_count];
+        bb->retrigger_divisions = retrigger_divs[selected];
+    } else {
+        bb->sub_slice_active = 0;
+    }
+    bb_update_status(bb);
+    bb->play_pos = (float)bb->slice_starts[bb->current_slice];
+}
+
 static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
     breakbeat_t *bb = (breakbeat_t *)instance;
 
-    /* Log once on the very first render call so we can see the initial state
-     * in the log even when the user never hears audio. */
-    if (bb && bb->dbg_first_render) {
-        bb->dbg_first_render = 0;
-        char buf[BB_PATH_MAX + 96];
-        int clock_status = (g_host && g_host->get_clock_status) ? g_host->get_clock_status() : -1;
-        snprintf(buf, sizeof(buf),
-                 "breakbeat: first render — data=%s frames=%u playing=%d clock_status=%d sample=%s",
-                 bb->data ? "ok" : "NULL",
-                 bb->total_frames,
-                 bb->playing,
-                 clock_status,
-                 bb->main_sample_path);
-        wp_log(buf);
-    }
-
-    if (!bb || !bb->data || bb->total_frames == 0) {
-        if (bb && bb->dbg_silence_reason != 1) {
-            bb->dbg_silence_reason = 1;
-            wp_log("breakbeat: silence — no sample loaded");
-        }
+    if (!bb) {
         memset(out_lr, 0, frames * 2 * sizeof(int16_t));
         return;
     }
 
-    /* Transport state via get_clock_status().
-     *
-     * UNAVAILABLE (0) means MIDI Sync is not configured for output — the host
-     * cannot report transport state. Treat as always running so the module
-     * produces audio; transport sync requires MIDI Sync = Out on the device. */
-    int clock_status = (g_host && g_host->get_clock_status)
-                     ? g_host->get_clock_status() : MOVE_CLOCK_STATUS_RUNNING;
-    int running = (clock_status == MOVE_CLOCK_STATUS_RUNNING)
-               || (clock_status == MOVE_CLOCK_STATUS_UNAVAILABLE);
-
-    if (clock_status != bb->dbg_last_clock_status) {
-        char dbgbuf[64];
-        snprintf(dbgbuf, sizeof(dbgbuf), "breakbeat: clock_status %d -> %d",
-                 bb->dbg_last_clock_status, clock_status);
-        wp_log(dbgbuf);
-        bb->dbg_last_clock_status = clock_status;
+    atomic_fetch_add_explicit(&bb->sample_readers, 1, memory_order_acquire);
+    if (atomic_load_explicit(&bb->sample_update, memory_order_acquire) ||
+        !bb->data || bb->total_frames == 0) {
+        atomic_fetch_sub_explicit(&bb->sample_readers, 1, memory_order_release);
+        memset(out_lr, 0, frames * 2 * sizeof(int16_t));
+        return;
     }
 
-    /* While stopped, track the set tempo from get_bpm() directly.
-     * With no MIDI clock running, get_bpm() returns the Move's set tempo knob
-     * value — stable and accurate. Updating every block keeps stable_bpm current
-     * so that if the user changes tempo while stopped, the first bar after
-     * transport start uses the correct rate without waiting for MIDI clock. */
-    if (!running && g_host && g_host->get_bpm) {
-        float set_bpm = g_host->get_bpm();
-        if (set_bpm >= 20.0f && set_bpm <= 400.0f) {
-            bb->stable_bpm = set_bpm;
-            /* If the cached samples_per_trigger implies a tempo that differs
-             * >5% from the set tempo, it's stale (tempo changed while stopped).
-             * Clear it so the first bar uses stable_bpm instead. */
-            if (bb->samples_per_trigger > 0.0f) {
-                /* spt → bpm: spt = spb*active_length/8, spb = SR*4*60/bpm
-                 * → bpm = SR*4*60*active_length / (8*spt) */
-                float cached_bpm = (MOVE_SAMPLE_RATE * 4.0f * 60.0f * bb->active_length)
-                                 / (8.0f * bb->samples_per_trigger);
-                float ratio = cached_bpm / set_bpm;
-                if (ratio < 0.95f || ratio > 1.05f)
-                    bb->samples_per_trigger = 0.0f;
-            }
+    int running = bb->timing.running;
+    if (running && !bb->was_running) bb_reset_transport(bb);
+    if (!running) bb->was_running = 0;
+
+    /* The stored Set tempo gives an immediate rate before the live clock has
+     * completed its first clean measurement window. While running, prefer the
+     * host's measured clock BPM so tempo-knob changes alter sample rate without
+     * requiring Stop/Start (Move may defer writing Song.abl until Stop). */
+    if (g_host && g_host->get_project_bpm) {
+        float bpm = g_host->get_project_bpm();
+        if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
+        else if (bb->stable_bpm < 20.0f && g_host->get_bpm) {
+            /* A newly loaded Set may briefly have no published snapshot. Use
+             * the host's best tempo once, then retain the last valid value. */
+            bpm = g_host->get_bpm();
+            if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
         }
+    } else if (g_host && g_host->get_bpm &&
+               (!running || bb->stable_bpm < 20.0f)) {
+        /* Compatibility only for older Schwung versions: never follow their
+         * live clock estimator continuously while audio is running. */
+        float bpm = g_host->get_bpm();
+        if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
     }
-
-    /* Detect transport start. */
-    if (running && !bb->was_running) {
-        if (bb->fa_received) {
-            /* 0xFA already reset everything. midi_tick has been counting since
-             * then, so we know exactly how many ticks elapsed in the T_fa→T_run
-             * gap. Use that to jump straight to the correct bar position instead
-             * of always starting from slice 0. */
-            bb->fa_received = 0;
-
-            /* Estimate samples_per_trigger for the position calculation.
-             * Prefer the cached measured value (accurate); fall back to
-             * stable_bpm (= Move set-tempo knob, always correct while stopped). */
-            float spt_est = bb->samples_per_trigger;
-            if (spt_est <= 0.0f) {
-                float spb = (MOVE_SAMPLE_RATE * 4.0f * 60.0f / bb->stable_bpm);
-                spt_est = spb * bb->active_length / 8.0f;
-            }
-
-            /* How many complete trigger intervals elapsed during the gap? */
-            int n = (bb->ticks_per_trigger > 0)
-                  ? (bb->midi_tick / bb->ticks_per_trigger) : 0;
-            int offset_ticks = (bb->ticks_per_trigger > 0)
-                              ? (bb->midi_tick % bb->ticks_per_trigger) : 0;
-
-            bb->trigger_count = n + 1; /* next tick-trigger gives beat n+1 */
-            bb->current_slice = n % 8;
-            bb->pending_trigger = 0;   /* handled by direct position set */
-
-            /* Start play_pos part-way into the current slice based on tick offset. */
-            float frac = (bb->ticks_per_trigger > 0)
-                       ? ((float)offset_ticks / (float)bb->ticks_per_trigger) : 0.0f;
-            bb->play_pos = (float)bb->slice_starts[bb->current_slice]
-                         + frac * (float)bb->slice_lengths[bb->current_slice];
-            bb->just_reset = 0; /* play_pos already set correctly */
-
-            bb->dbg_last_trigger_sample = bb->sample_counter;
-            bb->dbg_triggers_to_log = 10;
-
-            char dbgbuf[96];
-            snprintf(dbgbuf, sizeof(dbgbuf),
-                     "breakbeat: T_run ticks=%d n=%d offset=%d → slice=%d frac=%.2f",
-                     bb->midi_tick, n, offset_ticks, bb->current_slice, frac);
-            wp_log(dbgbuf);
-        } else {
-            /* No 0xFA received (MIDI Sync = Off or firmware variant). */
-            bb_reset_transport(bb);
-        }
+    if (running && g_host && g_host->get_bpm) {
+        /* Once MIDI clock is measured, get_bpm() returns that live value. Until
+         * then Schwung returns the stored Set BPM, so this is safe from the
+         * old first-bar low/zero estimate. */
+        float bpm = g_host->get_bpm();
+        if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
     }
-    bb->was_running = running;
+    if (bb->stable_bpm < 20.0f || bb->stable_bpm > 400.0f)
+        bb->stable_bpm = 120.0f;
 
     int previewing = (bb->preview_frames > 0);
     if (!running && !previewing) {
-        if (bb->dbg_silence_reason != 2) {
-            bb->dbg_silence_reason = 2;
-            wp_log("breakbeat: silence — transport stopped");
-        }
+        atomic_fetch_sub_explicit(&bb->sample_readers, 1, memory_order_release);
         memset(out_lr, 0, frames * 2 * sizeof(int16_t));
         return;
     }
@@ -1419,137 +1570,48 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
         bb->preview_frames -= frames;
         if (bb->preview_frames < 0) bb->preview_frames = 0;
     }
-    bb->dbg_silence_reason = 0;
-
-    /* BPM stability filter — only runs while transport is running.
-     *
-     * get_bpm() returns bad (too-low) values at transport start due to MIDI
-     * clock jitter; it also returns unreliable values while stopped. By only
-     * filtering while running we avoid accumulating bpm_low_count across
-     * stop/start cycles, which was poisoning stable_bpm after rapid restarts.
-     *
-     * Rules while running:
-     *   - Snap up immediately to any higher reading (correct tempo or increase).
-     *   - Drift down slowly if within 20% (normal fluctuation).
-     *   - Reject >20% below stable unless sustained 200+ blocks (~580ms),
-     *     indicating a genuine large tempo decrease.
-     */
-    /* ------------------------------------------------------------------ *
-     * Timing                                                             *
-     * ------------------------------------------------------------------ *
-     * Primary mode  — MIDI clock (MIDI Sync = Out):                     *
-     *   Triggers arrive via pending_trigger set in on_midi(0xF8).       *
-     *   Rate = slice_length / samples_per_trigger (measured from ticks) *
-     *                                                                    *
-     * Fallback mode — no MIDI clock (MIDI Sync = Off / first block):    *
-     *   Phase accumulator driven by stable_bpm (= Move set-tempo knob). *
-     * ------------------------------------------------------------------ */
-
-    /* samples_per_trigger for rate calculation.
-     * Use the tick-measured value when available; otherwise derive from
-     * the set tempo (accurate while stopped, stable while running). */
-    float spt; /* samples per trigger interval */
-    int tick_mode = (bb->samples_per_trigger > 0.0f);
-    if (tick_mode) {
-        spt = bb->samples_per_trigger;
-    } else {
-        float spb = ((float)MOVE_SAMPLE_RATE * 60.0f / bb->stable_bpm) * 4.0f;
-        spt = spb * bb->active_length / 8.0f;
-    }
-
-    /* Heartbeat log every ~10 seconds. */
-    if (bb->sample_counter - bb->dbg_last_heartbeat >= MOVE_SAMPLE_RATE * 10) {
-        bb->dbg_last_heartbeat = bb->sample_counter;
-        float dbg_bpm = (spt > 0.0f)
-                      ? (MOVE_SAMPLE_RATE * 60.0f * 4.0f * bb->active_length / 8.0f / spt)
-                      : bb->stable_bpm;
-        char hbbuf[128];
-        snprintf(hbbuf, sizeof(hbbuf),
-                 "breakbeat: heartbeat bpm=%.1f loop=%c slice=%d ticks=%s",
-                 dbg_bpm, bb->current_loop, bb->current_slice,
-                 tick_mode ? "yes" : "no");
-        wp_log(hbbuf);
-    }
+    float spt = bb_timing_samples_per_trigger(bb->stable_bpm,
+                                               bb->active_length,
+                                               MOVE_SAMPLE_RATE);
 
     /* Bar boundary ---------------------------------------------------- */
-    if (tick_mode) {
-        if (bb->pending_bar) {
+    if (running && bb->pending_bar) {
             bb->pending_bar = 0;
             bb->bar_counter++;
-            if (bb->pending_sample_path[0]) {
-                /* Apply the queued sample and snap to slice 0 immediately.
-                 * current_loop is updated from pending_loop HERE (not when
-                 * scheduled) so the status never shows the next loop early.
-                 * pending_trigger is cleared because the bar-boundary tick fires
-                 * simultaneously and would otherwise overwrite play_pos. */
-                bb->current_loop = bb->pending_loop;
-                apply_sample_path(bb, bb->pending_sample_path, bb->pending_main_length);
-                bb->pending_sample_path[0] = '\0';
+            if (bb->pending_sample_switch && bb->standby_loop == bb->pending_loop) {
+                /* Both A and B are already mapped. Swap ownership only; no file
+                 * access or page faults occur on the audio thread. */
+                char old_loop = bb->current_loop;
+                if (activate_standby_sample(bb) == 0) {
+                    bb->current_loop = bb->pending_loop;
+                    bb->standby_loop = old_loop;
+                }
+                bb->pending_sample_switch = 0;
                 bb->current_slice = 0;
                 bb->play_pos      = (float)bb->slice_starts[0];
                 bb->trigger_count = 1;
+                bb->timing.trigger_count = 1;
                 bb->pending_trigger = 0;
                 bb->sub_slice_active  = 0;
                 bb->sub_slice_counter = 0;
-                snprintf(bb->status_str, sizeof(bb->status_str),
-                         "%c_0_1x", bb->current_loop);
+                bb_update_status(bb);
             }
             if (bb->phrase_bars > 0) {
                 int bar_in_phrase = bb->bar_counter % bb->phrase_bars;
                 /* Schedule B two bars before the end (loads on last bar).
                  * Schedule A return on the last bar (loads on first bar of next phrase). */
                 if (bar_in_phrase == bb->phrase_bars - 2) {
-                    if ((float)rand() / (float)RAND_MAX < bb->swap_prob && bb->alt_sample_path[0]) {
-                        snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
-                                 "%s", bb->alt_sample_path);
-                        bb->pending_main_length = bb->alt_length;
+                    if (bb_rand(bb) < bb->swap_prob && bb->standby_loop == 'B') {
+                        bb->pending_sample_switch = 1;
                         bb->pending_loop = 'B';
                     }
                 } else if (bar_in_phrase == bb->phrase_bars - 1) {
-                    snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
-                             "%s", bb->main_sample_path);
-                    bb->pending_main_length = bb->main_length;
-                    bb->pending_loop = 'A';
-                }
-            }
-        }
-    } else {
-        /* Fallback: sample-counting bar boundary. */
-        float spb = spt * 8.0f / bb->active_length;
-        bb->bar_phase += (float)frames;
-        while (bb->bar_phase >= spb) {
-            bb->bar_phase -= spb;
-            bb->bar_counter++;
-            if (bb->pending_sample_path[0]) {
-                bb->current_loop = bb->pending_loop;
-                apply_sample_path(bb, bb->pending_sample_path, bb->pending_main_length);
-                bb->pending_sample_path[0] = '\0';
-                bb->trigger_phase = 0.0f;
-                bb->current_slice = 0;
-                bb->play_pos      = (float)bb->slice_starts[0];
-                bb->trigger_count = 1;
-                bb->sub_slice_active  = 0;
-                bb->sub_slice_counter = 0;
-                snprintf(bb->status_str, sizeof(bb->status_str),
-                         "%c_0_1x", bb->current_loop);
-            }
-            if (bb->phrase_bars > 0) {
-                int bar_in_phrase = bb->bar_counter % bb->phrase_bars;
-                if (bar_in_phrase == bb->phrase_bars - 1) {
-                    if ((float)rand() / (float)RAND_MAX < bb->swap_prob) {
-                        snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
-                                 "%s", bb->alt_sample_path);
-                        bb->pending_main_length = bb->alt_length;
-                        bb->pending_loop = 'B';
+                    if (bb->standby_loop == 'A') {
+                        bb->pending_sample_switch = 1;
+                        bb->pending_loop = 'A';
                     }
-                } else if (bar_in_phrase == 0 && bb->bar_counter > 0) {
-                    snprintf(bb->pending_sample_path, sizeof(bb->pending_sample_path),
-                             "%s", bb->main_sample_path);
-                    bb->pending_main_length = bb->main_length;
-                    bb->pending_loop = 'A';
                 }
             }
-        }
     }
 
     /* Slice triggers -------------------------------------------------- */
@@ -1558,98 +1620,16 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
         bb->play_pos = (float)bb->slice_starts[0];
     }
 
-/* Shared trigger-fire logic used by both tick and fallback modes. */
-#define BB_FIRE_TRIGGER(beat_pos) do {                                       \
-    slice_inputs_t _in = {                                                   \
-        .current_slice = bb->current_slice,                                  \
-        .beat_position = (beat_pos),                                         \
-        .complexity    = bb->complexity,                                     \
-        .anchor        = bb->anchor,                                         \
-        .roll          = bb->roll,                                           \
-        .phrase_bars   = bb->phrase_bars,                                    \
-        .fill          = bb->fill,                                           \
-        .bar_in_phrase = bb->phrase_bars > 0                                 \
-                       ? bb->bar_counter % bb->phrase_bars : 0,             \
-    };                                                                       \
-    bb->current_slice = (bb->complexity == 0.0f)                            \
-                      ? (beat_pos)                                           \
-                      : slice_select_next(&_in, bb_rand, NULL);             \
-    bb->sub_slice_counter = 0;                                               \
-    {   /* Roll each retrigger rate independently; pick one if any fire.      \
-         * retrig_p[i] is a per-bar probability set by the user.             \
-         * Convert to per-trigger using the exact inverse binomial formula:  \
-         *   p_trig = 1 - (1 - p_bar)^(1/N)  where N = triggers per bar     \
-         * This ensures 100% always fires and 0% never fires, and all        \
-         * intermediate values are perceptually proportional to bar odds.    \
-         * N = 8 / active_length (e.g. 8 for 1-bar, 4 for 2-bar loops).    */ \
-        static const int _rdivs[4] = {2, 3, 4, 8};                          \
-        float _tpb = (bb->active_length > 0.0f)                             \
-                   ? (8.0f / bb->active_length) : 8.0f;                     \
-        float _inv_tpb = 1.0f / _tpb;                                       \
-        int _fired[4], _n = 0;                                               \
-        for (int _i = 0; _i < 4; _i++) {                                    \
-            float _pb = bb->retrig_p[_i];                                   \
-            if (_pb <= 0.0f) continue;                                       \
-            float _p = (_pb >= 1.0f) ? 1.0f                                 \
-                                     : 1.0f - powf(1.0f - _pb, _inv_tpb);  \
-            if ((float)rand() / (float)RAND_MAX < _p)                       \
-                _fired[_n++] = _i;                                           \
-        }                                                                    \
-        if (_n > 0) {                                                        \
-            bb->sub_slice_active = 1;                                        \
-            bb->retrigger_divisions = _rdivs[_fired[rand() % _n]];          \
-        } else {                                                              \
-            bb->sub_slice_active = 0;                                        \
-        }                                                                    \
-    }                                                                        \
-    snprintf(bb->status_str, sizeof(bb->status_str), "%c_%d_%dx",           \
-             bb->current_loop, bb->current_slice,                            \
-             bb->sub_slice_active ? bb->retrigger_divisions : 1);           \
-    bb->play_pos = (float)bb->slice_starts[bb->current_slice];              \
-    {   /* diagnostic log */                                                 \
-        uint64_t _now = bb->sample_counter;                                  \
-        uint64_t _iv  = _now - bb->dbg_last_trigger_sample;                 \
-        bb->dbg_last_trigger_sample = _now;                                  \
-        int _log = (bb->dbg_triggers_to_log > 0);                           \
-        if (!_log && spt > 0.0f) {                                           \
-            _log = (_iv < (uint64_t)(spt*0.9f) || _iv > (uint64_t)(spt*1.1f)); \
-        }                                                                    \
-        if (_log) {                                                          \
-            if (bb->dbg_triggers_to_log > 0) bb->dbg_triggers_to_log--;    \
-            char _tb[128];                                                   \
-            snprintf(_tb, sizeof(_tb),                                       \
-                "breakbeat: trig beat=%d slice=%d spt=%.0f interval=%llu",  \
-                (beat_pos), bb->current_slice, spt,                         \
-                (unsigned long long)_iv);                                    \
-            wp_log(_tb);                                                     \
-        }                                                                    \
-    }                                                                        \
-} while(0)
-
-    if (tick_mode) {
-        if (bb->pending_trigger) {
-            bb->pending_trigger = 0;
-            BB_FIRE_TRIGGER(bb->pending_beat_pos);
-        }
-    } else {
-        /* Fallback: phase accumulator. */
-        bb->trigger_phase += (float)frames;
-        while (bb->trigger_phase >= spt) {
-            bb->trigger_phase -= spt;
-            int bp = bb->trigger_count % 8;
-            bb->trigger_count++;
-            BB_FIRE_TRIGGER(bp);
-        }
+    if (running && bb->pending_trigger) {
+        bb->pending_trigger = 0;
+        bb_fire_trigger(bb, bb->pending_beat_pos);
     }
-#undef BB_FIRE_TRIGGER
 
-    /* Rate: slice_length / samples_per_trigger
-     * This is algebraically identical to total_frames / (samples_per_bar * active_length)
-     * but derived purely from measured tick timing with no BPM math. */
+    /* Rate is exact from the current Set BPM on the first block. MIDI clock
+     * corrects phase at each trigger but is never used as a warm-up estimator. */
     float slice_len = (bb->current_slice < 8)
                     ? (float)bb->slice_lengths[bb->current_slice] : 0.0f;
     float rate = (slice_len > 0.0f && spt > 0.0f) ? slice_len / spt : 1.0f;
-
     const int nch = bb->num_channels;
     const int is_float = (bb->audio_format == WAV_FORMAT_FLOAT);
     const int bits = bb->bits_per_sample;
@@ -1730,6 +1710,7 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
         bb->play_pos += rate;
     }
     bb->sample_counter += frames;
+    atomic_fetch_sub_explicit(&bb->sample_readers, 1, memory_order_release);
 }
 
 static plugin_api_v2_t g_plugin_api_v2 = {

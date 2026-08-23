@@ -2,3 +2,5 @@ build/
 dist/
 tests/test_slice_select
 tests/test_slice_select.dSYM/
+tests/test_bb_timing
+tests/test_bb_timing.dSYM/

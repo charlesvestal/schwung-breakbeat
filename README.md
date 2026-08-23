@@ -151,6 +151,33 @@ ssh-keygen -R move.local
 
 ## Changelog
 
+### v0.4.7 (test build)
+- **Dynamic tempo changes.** Stored Set BPM supplies the correct playback rate immediately on Start; after Schwung has a clean live-clock measurement, that BPM controls the sample cursor so tempo changes alter pitch/speed without Stop/Start.
+
+### v0.4.6 (test build)
+- **Actual Set tempo reaches the module.** Schwung now reads the active Set's stored BPM on its worker thread and publishes it through the real-time-safe plugin callback. Previously the callback existed but remained zero, causing Breakbeat to fall back to 120 BPM (including in the 91 BPM test Set).
+- **Safe startup fallback.** If the Set snapshot is briefly unavailable during loading, Breakbeat takes one valid host BPM and retains the last known tempo instead of repeatedly resetting to 120 BPM.
+
+### v0.4.5 (test build)
+- **Clock-authoritative scheduling.** MIDI Start/Stop and the incoming 24-PPQN clock are now the sole authority for slice and bar boundaries. The interpolated host playhead is no longer used for audio scheduling.
+- **Original phrase structure restored.** In a four-bar phrase, A occupies bars one through three and B occupies only bar four, regardless of B's declared source length.
+- **Stored project tempo.** Breakbeat reads Schwung's explicit Set/project BPM when instantiated and whenever the user changes it. Live MIDI-clock measurement is never used for playback speed; clock pulses control boundaries only.
+
+### v0.4.4 (test build)
+- **Continuous audio cursor.** Absolute song position still schedules slices and A/B boundaries, but audio now runs continuously between them at the Set tempo. This removes the clicks and distortion caused by tiny per-block cursor corrections in v0.4.3.
+
+### v0.4.3 (test build)
+- **Song-position timing.** Slice choice and playback phase now come from Schwung's absolute song beat, so playback starts on the correct slice without a preroll and is re-anchored every audio block instead of accumulating drift.
+- **Exact B-loop placement.** A selected B loop plays once and ends on the phrase boundary. For example, a two-bar B loop in a four-bar phrase occupies bars three and four, then returns to A exactly once.
+- **Independent B sequence.** A/B changes reset the authoritative trigger sequence, preventing B from inheriting A's slice number or firing duplicate transitions.
+
+### v0.4.1 (test build)
+- **Transport is explicit.** MIDI Start begins playback at slice zero, MIDI Stop silences the next block, and clock ticks received while stopped cannot start audio.
+- **Immediate tempo lock.** Playback rate comes from Schwung's current Set tempo on the first block; MIDI clock supplies musical phase rather than a loop-dependent warm-up measurement.
+- **Silent Set restore.** Programmatic preset/state restoration no longer starts sample preview while the Move is stopped.
+- **Real-time-safe phrase swaps.** A and B are mapped before playback and bar-boundary changes swap resident sample metadata without file I/O, logging, or allocation in the audio callback.
+- **State fixes.** Preset ID and both A/B loop lengths now round-trip consistently, with compatibility for v0.4 state.
+
 ### v0.4.0
 - **Multi-rate retrigger.** Replaced the single Retrigger + Retrig Rate pair with four independent per-bar probability knobs (Retrig 2x / 3x / 4x / 8x). Any combination can be active simultaneously; if multiple rates fire on the same beat one is chosen at random. Probabilities are normalised correctly using the inverse binomial formula so 100% guarantees the rate fires on every beat and 5% means roughly 5% of bars. Old presets migrate automatically.
 - **Sample preview.** Changing A Sample or Preset while transport is stopped now plays one full loop of the selected break immediately, using the current tempo knob value for rate. Lets you audition samples from the file browser without starting the transport.

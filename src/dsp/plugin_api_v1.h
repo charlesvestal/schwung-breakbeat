@@ -113,6 +113,13 @@ typedef struct host_api_v1 {
      * NULL if host does not support tempo. */
     float (*get_bpm)(void);
 
+    /* Appended host callbacks. Keep these at the end for ABI compatibility
+     * with older Schwung versions. */
+    int (*midi_inject_to_move)(const uint8_t *msg, int len);
+    int (*slot_recv_channel)(void *instance);
+    double (*get_beat_position)(void);
+    float (*get_project_bpm)(void);
+
 } host_api_v1_t;
 
 /*

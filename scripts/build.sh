@@ -90,6 +90,7 @@ echo "Compiling DSP..."
     -Isrc/dsp \
     src/dsp/breakbeat.c \
     src/dsp/slice_select.c \
+    src/dsp/bb_timing.c \
     -o build/dsp.so \
     -lm
 

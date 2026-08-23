@@ -45,8 +45,8 @@ static void send_clock_ticks(plugin_api_v2_t *api, void *instance,
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <native-dsp.so> <sample.wav>\n", argv[0]);
+    if (argc != 4) {
+        fprintf(stderr, "usage: %s <native-dsp.so> <sample.wav> <alternate.wav>\n", argv[0]);
         return 2;
     }
 
@@ -149,6 +149,15 @@ int main(int argc, char **argv) {
     CHECK(strncmp(status, "A_0_", 4) == 0,
           "MIDI Start begins A on slice zero");
 
+    api->set_param(instance, "A_sample_length", "1"); /* 1/2 bar */
+    send_clock_ticks(api, instance, 6, audio);
+    api->get_param(instance, "status", status, sizeof(status));
+    CHECK(strncmp(status, "A_1_", 4) == 0,
+          "live A length change takes effect at the next new trigger interval");
+    api->set_param(instance, "A_sample_length", "2"); /* restore 1 bar */
+    api->on_midi(instance, &start, 1, MOVE_MIDI_SOURCE_HOST);
+    api->render_block(instance, audio, MOVE_FRAMES_PER_BLOCK);
+
     g_project_bpm = 142.0f;
     g_host_bpm = 142.0f;
     api->render_block(instance, audio, MOVE_FRAMES_PER_BLOCK);
@@ -195,7 +204,14 @@ int main(int argc, char **argv) {
     CHECK(strncmp(status, "B_0_", 4) == 0,
           "B begins on bar four regardless of its two-bar source length");
 
-    send_clock_ticks(api, instance, 95, audio);
+    api->set_param(instance, "B_sample_length", "1"); /* 1/2 bar */
+    send_clock_ticks(api, instance, 6, audio);
+    api->get_param(instance, "status", status, sizeof(status));
+    CHECK(strncmp(status, "B_1_", 4) == 0,
+          "live B length change takes effect while B is active");
+    api->set_param(instance, "B_sample_length", "3"); /* restore 2 bars */
+
+    send_clock_ticks(api, instance, 89, audio);
     api->get_param(instance, "status", status, sizeof(status));
     CHECK(status[0] == 'B', "B remains active through the final phrase bar");
 
@@ -231,6 +247,35 @@ int main(int argc, char **argv) {
     api->render_block(instance, audio, MOVE_FRAMES_PER_BLOCK);
     CHECK(buffer_is_silent(audio, MOVE_FRAMES_PER_BLOCK * 2),
           "clock while stopped cannot restart playback");
+
+    /* Regression: the Movy filepath browser can commit A while transport is
+     * running. It must load off-thread and survive the next Stop/Start. */
+    api->on_midi(instance, &start, 1, MOVE_MIDI_SOURCE_HOST);
+    api->set_param(instance, "A_sample_path", argv[3]);
+    usleep(250000);
+    api->on_midi(instance, &stop, 1, MOVE_MIDI_SOURCE_HOST);
+    api->on_midi(instance, &start, 1, MOVE_MIDI_SOURCE_HOST);
+    int16_t switched_audio[MOVE_FRAMES_PER_BLOCK * 2];
+    api->render_block(instance, switched_audio, MOVE_FRAMES_PER_BLOCK);
+
+    preset = fopen(preset_path, "w");
+    CHECK(preset != NULL, "rewrite reference preset for alternate sample");
+    if (preset) {
+        fprintf(preset,
+                "{\"A_sample_path\":\"%s\",\"A_sample_length\":\"1 bar\","
+                "\"B_sample_path\":\"%s\",\"B_sample_length\":\"2 bars\","
+                "\"phrase\":\"Off\"}\n", argv[3], argv[2]);
+        fclose(preset);
+    }
+    void *reference = api->create_instance(temp_dir, "{}");
+    CHECK(reference != NULL, "create alternate-sample reference instance");
+    int16_t expected_audio[MOVE_FRAMES_PER_BLOCK * 2];
+    api->on_midi(reference, &start, 1, MOVE_MIDI_SOURCE_HOST);
+    api->render_block(reference, expected_audio, MOVE_FRAMES_PER_BLOCK);
+    CHECK(buffers_equal(switched_audio, expected_audio,
+                        MOVE_FRAMES_PER_BLOCK * 2),
+          "A filepath selection while running changes the mapped audio");
+    api->destroy_instance(reference);
 
     api->destroy_instance(instance);
     dlclose(handle);

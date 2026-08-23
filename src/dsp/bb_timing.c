@@ -4,7 +4,14 @@ void bb_timing_init(bb_timing_t *timing) {
     if (!timing) return;
     timing->running = 0;
     timing->tick_in_bar = 0;
+    timing->tick_in_cycle = 0;
     timing->trigger_count = 0;
+}
+
+void bb_timing_reset_trigger_phase(bb_timing_t *timing) {
+    if (!timing) return;
+    timing->tick_in_cycle = 0;
+    timing->trigger_count = 1;
 }
 
 int bb_timing_on_realtime(bb_timing_t *timing,
@@ -17,6 +24,7 @@ int bb_timing_on_realtime(bb_timing_t *timing,
     if (status == 0xFA || status == 0xFB) {
         timing->running = 1;
         timing->tick_in_bar = 0;
+        timing->tick_in_cycle = 0;
         /* Slice zero starts immediately on Start. The first scheduled trigger
          * therefore advances to slice/beat one. */
         timing->trigger_count = 1;
@@ -26,14 +34,17 @@ int bb_timing_on_realtime(bb_timing_t *timing,
     if (status == 0xFC) {
         timing->running = 0;
         timing->tick_in_bar = 0;
+        timing->tick_in_cycle = 0;
         timing->trigger_count = 0;
         return BB_TIMING_STOP;
     }
     if (status != 0xF8 || !timing->running) return 0;
 
     timing->tick_in_bar++;
+    timing->tick_in_cycle++;
     int events = 0;
-    if ((timing->tick_in_bar % ticks_per_trigger) == 0) {
+    if (timing->tick_in_cycle >= ticks_per_trigger) {
+        timing->tick_in_cycle = 0;
         if (beat_position) *beat_position = timing->trigger_count & 7;
         timing->trigger_count++;
         events |= BB_TIMING_TRIGGER;

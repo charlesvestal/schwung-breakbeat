@@ -11,10 +11,14 @@
 typedef struct {
     int running;
     int tick_in_bar;
+    int tick_in_cycle;
     int trigger_count;
 } bb_timing_t;
 
 void bb_timing_init(bb_timing_t *timing);
+
+/* Restart only the slice grid. The transport/bar phase is deliberately kept. */
+void bb_timing_reset_trigger_phase(bb_timing_t *timing);
 
 /* Process one MIDI realtime byte. Returns a BB_TIMING_* bitmask. Clock ticks
  * received while stopped advance no state and produce no events. */

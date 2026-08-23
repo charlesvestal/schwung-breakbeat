@@ -24,14 +24,16 @@ mkdir -p build/tests
 cc -Wall -Wextra -O0 -g -std=c11 -shared -fPIC \
     -Isrc/dsp \
     src/dsp/breakbeat.c src/dsp/slice_select.c src/dsp/bb_timing.c \
-    -lm \
+    -lm -pthread \
     -o build/tests/dsp.so
 
 cc -Wall -Wextra -O0 -g -std=c11 \
     -Isrc/dsp \
     tests/test_plugin_runtime.c \
+    -pthread \
     -o build/tests/test_plugin_runtime
 
 ./build/tests/test_plugin_runtime \
     "$REPO_ROOT/build/tests/dsp.so" \
-    "$REPO_ROOT/samples/amen01.wav"
+    "$REPO_ROOT/samples/amen01.wav" \
+    "$REPO_ROOT/samples/sesame.wav"

@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include <math.h>
 #include <stdatomic.h>
 #include <sched.h>
+#include <pthread.h>
 
 /* WAV audio format codes */
 #define WAV_FORMAT_PCM   1
@@ -152,6 +154,16 @@ typedef struct {
     atomic_int sample_update;
     atomic_int sample_readers;
 
+    /* Filepath parameters arrive on Schwung's realtime SPI callback.  Publish
+     * fixed-size requests to a SCHED_OTHER worker; it performs open/mmap and
+     * replaces the requested A/B slot behind sample_update. */
+    pthread_t sample_loader_thread;
+    atomic_int sample_loader_stop;
+    atomic_int sample_loader_started;
+    atomic_uint sample_request_seq[2];
+    char sample_request_path[2][BB_PATH_MAX];
+    float sample_request_length[2];
+
     /* Diagnostics — log key events once rather than every block. */
     int dbg_first_render;     /* 1 until first render_block call is logged */
     int dbg_silence_reason;   /* last silence reason code logged (0 = none yet) */
@@ -163,6 +175,8 @@ typedef struct {
 static const host_api_v1_t *g_host = NULL;
 static char g_preset_filenames[32][64];
 static int g_total_presets = 0;
+
+static void bb_start_preview(breakbeat_t *bb);
 
 static void wp_log(const char *msg) {
     if (g_host && g_host->log) g_host->log(msg);
@@ -465,8 +479,7 @@ static int open_wav(breakbeat_t *wp, const char *path, float expected_length) {
         close(fd);
         return -1;
     }
-    /* Pre-fault all pages now, while we're still in the MIDI callback (not
-     * the RT render thread). Without this, render_block would trigger OS page
+    /* Pre-fault all pages on the loader thread. Without this, render_block would trigger OS page
      * faults on first access, causing latency spikes that can trip Schwung's
      * render watchdog and kill the module. */
     madvise(map, map_size, MADV_WILLNEED);
@@ -577,6 +590,155 @@ static int open_wav(breakbeat_t *wp, const char *path, float expected_length) {
     wp_log(logbuf);
 
     return 0;
+}
+
+static void move_active_sample_to_slot(breakbeat_t *src, bb_sample_slot_t *dst,
+                                       float musical_length) {
+    memset(dst, 0, sizeof(*dst));
+    dst->fd = src->fd;
+    dst->map = src->map;
+    dst->map_size = src->map_size;
+    dst->data = src->data;
+    dst->total_frames = src->total_frames;
+    dst->num_channels = src->num_channels;
+    dst->audio_format = src->audio_format;
+    dst->bits_per_sample = src->bits_per_sample;
+    memcpy(dst->slice_starts, src->slice_starts, sizeof(dst->slice_starts));
+    memcpy(dst->slice_lengths, src->slice_lengths, sizeof(dst->slice_lengths));
+    dst->musical_length = musical_length;
+    src->fd = -1;
+    src->map = NULL;
+    src->data = NULL;
+}
+
+static void install_loaded_sample(breakbeat_t *bb, char loop,
+                                  bb_sample_slot_t *loaded) {
+    atomic_store_explicit(&bb->sample_update, 1, memory_order_release);
+    while (atomic_load_explicit(&bb->sample_readers, memory_order_acquire) > 0)
+        sched_yield();
+
+    /* A length knob may have moved while the worker was opening this file. */
+    loaded->musical_length = (loop == 'A') ? bb->main_length : bb->alt_length;
+
+    if (bb->current_loop == loop) {
+        close_file(bb);
+        bb->fd = loaded->fd;
+        bb->map = loaded->map;
+        bb->map_size = loaded->map_size;
+        bb->data = loaded->data;
+        bb->total_frames = loaded->total_frames;
+        bb->num_channels = loaded->num_channels;
+        bb->audio_format = loaded->audio_format;
+        bb->bits_per_sample = loaded->bits_per_sample;
+        memcpy(bb->slice_starts, loaded->slice_starts, sizeof(bb->slice_starts));
+        memcpy(bb->slice_lengths, loaded->slice_lengths, sizeof(bb->slice_lengths));
+        bb->active_length = loaded->musical_length;
+        bb->ticks_per_trigger = (int)(12.0f * bb->active_length + 0.5f);
+        if (bb->ticks_per_trigger < 1) bb->ticks_per_trigger = 1;
+        /* Keep the transport's slice identity. A new file should replace the
+         * sound under the playhead, not restart the sequencer at slice zero. */
+        bb->current_slice &= 7;
+        bb->play_pos = (float)bb->slice_starts[bb->current_slice];
+        if (!bb->timing.running) bb_start_preview(bb);
+        loaded->fd = -1;
+        loaded->map = NULL;
+        loaded->data = NULL;
+    } else if (bb->standby_loop == loop) {
+        close_sample_slot(&bb->standby_sample);
+        bb->standby_sample = *loaded;
+        loaded->fd = -1;
+        loaded->map = NULL;
+        loaded->data = NULL;
+    }
+
+    atomic_store_explicit(&bb->sample_update, 0, memory_order_release);
+}
+
+static void *sample_loader_main(void *arg) {
+    breakbeat_t *bb = (breakbeat_t *)arg;
+
+    /* pthread_create inherits Schwung's FIFO-90 callback priority. Demote and
+     * leave core 3 to the SPI/audio callback before doing any work. */
+#ifdef __linux__
+    struct sched_param sp = { .sched_priority = 0 };
+    (void)sched_setscheduler(0, SCHED_OTHER, &sp);
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    CPU_SET(0, &cpus); CPU_SET(1, &cpus); CPU_SET(2, &cpus);
+    (void)sched_setaffinity(0, sizeof(cpus), &cpus);
+#endif
+
+    unsigned consumed[2] = {0, 0};
+    const struct timespec idle = { .tv_sec = 0, .tv_nsec = 5000000 };
+    while (!atomic_load_explicit(&bb->sample_loader_stop, memory_order_acquire)) {
+        int did_work = 0;
+        for (int which = 0; which < 2; which++) {
+            unsigned seq1 = atomic_load_explicit(&bb->sample_request_seq[which],
+                                                 memory_order_acquire);
+            if ((seq1 & 1u) || seq1 == consumed[which]) continue;
+
+            char path[BB_PATH_MAX];
+            float length;
+            memcpy(path, bb->sample_request_path[which], sizeof(path));
+            length = bb->sample_request_length[which];
+            atomic_thread_fence(memory_order_acquire);
+            unsigned seq2 = atomic_load_explicit(&bb->sample_request_seq[which],
+                                                 memory_order_acquire);
+            if (seq1 != seq2 || (seq2 & 1u)) continue;
+            consumed[which] = seq2;
+            did_work = 1;
+
+            breakbeat_t tmp;
+            memset(&tmp, 0, sizeof(tmp));
+            tmp.fd = -1;
+            tmp.ticks_per_trigger = 12;
+            if (open_wav(&tmp, path, length) == 0) {
+                bb_sample_slot_t loaded;
+                move_active_sample_to_slot(&tmp, &loaded, length);
+                /* If the user chose another file while this one was loading,
+                 * discard the stale result instead of briefly auditioning it. */
+                if (atomic_load_explicit(&bb->sample_request_seq[which],
+                                         memory_order_acquire) == seq2)
+                    install_loaded_sample(bb, which == 0 ? 'A' : 'B', &loaded);
+                close_sample_slot(&loaded);
+            }
+        }
+        if (!did_work) nanosleep(&idle, NULL);
+    }
+    return NULL;
+}
+
+static void request_sample_load(breakbeat_t *bb, int which,
+                                const char *path, float length) {
+    if (!bb || which < 0 || which > 1 || !path || !path[0]) return;
+    atomic_fetch_add_explicit(&bb->sample_request_seq[which], 1,
+                              memory_order_acq_rel); /* odd: writer active */
+    snprintf(bb->sample_request_path[which], BB_PATH_MAX, "%s", path);
+    bb->sample_request_length[which] = length;
+    atomic_fetch_add_explicit(&bb->sample_request_seq[which], 1,
+                              memory_order_release); /* even: published */
+}
+
+static void set_loop_musical_length(breakbeat_t *bb, char loop, float length) {
+    if (bb->current_loop == loop) {
+        /* Playback rate is calculated from active_length every render block,
+         * so this is audible immediately. The MIDI-clock trigger cadence uses
+         * the new divisor beginning with the next tick. */
+        bb->active_length = length;
+        bb->ticks_per_trigger = (int)(12.0f * length + 0.5f);
+        if (bb->ticks_per_trigger < 1) bb->ticks_per_trigger = 1;
+        /* Length changes begin a fresh, deterministic slice cycle without
+         * disturbing tick_in_bar, which owns the four-bar phrase grid. */
+        bb_timing_reset_trigger_phase(&bb->timing);
+        bb->pending_trigger = 0;
+        bb->current_slice = 0;
+        bb->play_pos = (float)bb->slice_starts[0];
+        bb->sub_slice_active = 0;
+        bb->sub_slice_counter = 0;
+        bb_update_status(bb);
+    } else if (bb->standby_loop == loop) {
+        bb->standby_sample.musical_length = length;
+    }
 }
 
 /* Load the non-playing A/B sample from a control-thread call. open_wav is
@@ -843,6 +1005,10 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     bb->standby_sample.fd = -1;
     atomic_init(&bb->sample_update, 0);
     atomic_init(&bb->sample_readers, 0);
+    atomic_init(&bb->sample_loader_stop, 0);
+    atomic_init(&bb->sample_loader_started, 0);
+    atomic_init(&bb->sample_request_seq[0], 0);
+    atomic_init(&bb->sample_request_seq[1], 0);
     bb->dbg_first_render = 1;
     bb->dbg_silence_reason = 0;
     bb->dbg_last_clock_status = -1;
@@ -889,12 +1055,21 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     load_preset_idx(bb, 0);
     bb->playing = 1;
 
+    if (pthread_create(&bb->sample_loader_thread, NULL,
+                       sample_loader_main, bb) == 0)
+        atomic_store_explicit(&bb->sample_loader_started, 1,
+                              memory_order_release);
+
     return bb;
 }
 
 static void bb_destroy_instance(void *instance) {
     breakbeat_t *bb = (breakbeat_t *)instance;
     if (!bb) return;
+    if (atomic_load_explicit(&bb->sample_loader_started, memory_order_acquire)) {
+        atomic_store_explicit(&bb->sample_loader_stop, 1, memory_order_release);
+        pthread_join(bb->sample_loader_thread, NULL);
+    }
     close_file(bb);
     close_sample_slot(&bb->standby_sample);
     free(bb);
@@ -937,16 +1112,8 @@ static void bb_reset_transport(breakbeat_t *bb) {
     bb->trigger_phase = 0.0f;
     bb->bar_phase     = 0.0f;
     bb->was_running = 1;
-    /* For phrase=2, bar_in_phrase=phrase_bars-2=0 is never hit as a real bar
-     * boundary (bar_counter starts at 0 and first boundary makes it 1).
-     * Pre-schedule B here so it loads correctly at bar 1. */
     bb->pending_sample_path[0] = '\0';
     bb->pending_sample_switch = 0;
-    if (bb->phrase_bars == 2 && bb->alt_sample_path[0] &&
-        bb->standby_loop == 'B' && bb_rand(bb) < bb->swap_prob) {
-        bb->pending_sample_switch = 1;
-        bb->pending_loop = 'B';
-    }
     bb->preview_frames = 0;
     bb_update_status(bb);
 }
@@ -1046,25 +1213,19 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
     }
     else if (strcmp(key, "A_sample_path") == 0) {
         resolve_sample_path(bb->module_dir, val, bb->main_sample_path, sizeof(bb->main_sample_path));
-
-        int is_running = 0;
-        if (g_host && g_host->get_clock_status) {
-            is_running = (g_host->get_clock_status() == 2);
-        }
-
-        if (!is_running) {
+        if (atomic_load_explicit(&bb->sample_loader_started, memory_order_acquire))
+            request_sample_load(bb, 0, bb->main_sample_path, bb->main_length);
+        else if (!bb->timing.running) {
             apply_sample_path(bb, bb->main_sample_path, bb->main_length);
-            bb->pending_sample_path[0] = '\0';
-            bb->pending_sample_switch = 0;
             bb_start_preview(bb);
-        } else {
-            wp_log("breakbeat: stop transport before changing A Sample");
         }
     }
     else if (strcmp(key, "B_sample_path") == 0) {
         resolve_sample_path(bb->module_dir, val, bb->alt_sample_path, sizeof(bb->alt_sample_path));
-        if (!bb->timing.running &&
-            load_standby_sample(bb, bb->alt_sample_path, bb->alt_length) == 0)
+        if (atomic_load_explicit(&bb->sample_loader_started, memory_order_acquire))
+            request_sample_load(bb, 1, bb->alt_sample_path, bb->alt_length);
+        else if (!bb->timing.running &&
+                 load_standby_sample(bb, bb->alt_sample_path, bb->alt_length) == 0)
             bb->standby_loop = 'B';
     }
     else if (strcmp(key, "A_sample_length") == 0 || strcmp(key, "length") == 0) {
@@ -1073,13 +1234,7 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         if (idx >= 0 && idx < 6) {
             bb->length = lengths[idx];
             bb->main_length = lengths[idx];
-            if (!bb->timing.running && bb->current_loop == 'A') {
-                bb->active_length = bb->main_length;
-                bb->ticks_per_trigger = (int)(12.0f * bb->active_length + 0.5f);
-                if (bb->ticks_per_trigger < 1) bb->ticks_per_trigger = 1;
-            } else if (bb->standby_loop == 'A') {
-                bb->standby_sample.musical_length = bb->main_length;
-            }
+            set_loop_musical_length(bb, 'A', bb->main_length);
         }
     }
     else if (strcmp(key, "B_sample_length") == 0 || strcmp(key, "alt_length") == 0) {
@@ -1087,13 +1242,7 @@ static void bb_set_param(void *instance, const char *key, const char *val) {
         float lengths[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
         if (idx >= 0 && idx < 6) {
             bb->alt_length = lengths[idx];
-            if (!bb->timing.running && bb->current_loop == 'B') {
-                bb->active_length = bb->alt_length;
-                bb->ticks_per_trigger = (int)(12.0f * bb->active_length + 0.5f);
-                if (bb->ticks_per_trigger < 1) bb->ticks_per_trigger = 1;
-            } else if (bb->standby_loop == 'B') {
-                bb->standby_sample.musical_length = bb->alt_length;
-            }
+            set_loop_musical_length(bb, 'B', bb->alt_length);
         }
     }
     else if (strcmp(key, "complexity") == 0) {
@@ -1578,38 +1727,29 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
     if (running && bb->pending_bar) {
             bb->pending_bar = 0;
             bb->bar_counter++;
-            if (bb->pending_sample_switch && bb->standby_loop == bb->pending_loop) {
-                /* Both A and B are already mapped. Swap ownership only; no file
-                 * access or page faults occur on the audio thread. */
-                char old_loop = bb->current_loop;
-                if (activate_standby_sample(bb) == 0) {
-                    bb->current_loop = bb->pending_loop;
-                    bb->standby_loop = old_loop;
-                }
-                bb->pending_sample_switch = 0;
-                bb->current_slice = 0;
-                bb->play_pos      = (float)bb->slice_starts[0];
-                bb->trigger_count = 1;
-                bb->timing.trigger_count = 1;
-                bb->pending_trigger = 0;
-                bb->sub_slice_active  = 0;
-                bb->sub_slice_counter = 0;
-                bb_update_status(bb);
-            }
             if (bb->phrase_bars > 0) {
                 int bar_in_phrase = bb->bar_counter % bb->phrase_bars;
-                /* Schedule B two bars before the end (loads on last bar).
-                 * Schedule A return on the last bar (loads on first bar of next phrase). */
-                if (bar_in_phrase == bb->phrase_bars - 2) {
-                    if (bb_rand(bb) < bb->swap_prob && bb->standby_loop == 'B') {
-                        bb->pending_sample_switch = 1;
-                        bb->pending_loop = 'B';
+                char wanted = 'A';
+                if (bar_in_phrase == bb->phrase_bars - 1 &&
+                    bb_rand(bb) < bb->swap_prob)
+                    wanted = 'B';
+
+                /* Both loops are resident: enforce the phrase directly at
+                 * the downbeat instead of carrying a one-bar-ahead pending
+                 * switch that can become stale after parameter edits. */
+                if (bb->current_loop != wanted && bb->standby_loop == wanted) {
+                    char old_loop = bb->current_loop;
+                    if (activate_standby_sample(bb) == 0) {
+                        bb->current_loop = wanted;
+                        bb->standby_loop = old_loop;
                     }
-                } else if (bar_in_phrase == bb->phrase_bars - 1) {
-                    if (bb->standby_loop == 'A') {
-                        bb->pending_sample_switch = 1;
-                        bb->pending_loop = 'A';
-                    }
+                    bb_timing_reset_trigger_phase(&bb->timing);
+                    bb->pending_trigger = 0;
+                    bb->current_slice = 0;
+                    bb->play_pos = (float)bb->slice_starts[0];
+                    bb->sub_slice_active = 0;
+                    bb->sub_slice_counter = 0;
+                    bb_update_status(bb);
                 }
             }
     }

@@ -92,7 +92,7 @@ echo "Compiling DSP..."
     src/dsp/slice_select.c \
     src/dsp/bb_timing.c \
     -o build/dsp.so \
-    -lm
+    -lm -pthread
 
 echo "Packaging..."
 cat build/dsp.so > "$DIST_DIR/dsp.so"

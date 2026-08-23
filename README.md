@@ -151,6 +151,13 @@ ssh-keygen -R move.local
 
 ## Changelog
 
+### v0.4.11
+- **Deterministic transport and phrasing.** MIDI clock owns bar boundaries directly: A plays the non-fill bars and B is selected only on the final phrase bar, with no deferred one-bar-ahead switch state.
+- **Stable live editing.** A/B sample choices load on a low-priority worker without blocking Move's shared audio callback. Replacing a sample preserves the current slice instead of shifting the sequence.
+- **Immediate length changes.** A Length and B Length update playback rate immediately and restart only their slice grid; the bar and phrase clocks remain untouched.
+- **Reliable tempo response.** Playback starts at the stored Set tempo and follows live tempo changes without a Stop/Start cycle.
+- **Transport correctness.** Breakbeat remains silent while stopped, begins on A slice zero, and returns to A on the exact next phrase downbeat after its one-bar B fill.
+
 ### v0.4.7 (test build)
 - **Dynamic tempo changes.** Stored Set BPM supplies the correct playback rate immediately on Start; after Schwung has a clean live-clock measurement, that BPM controls the sample cursor so tempo changes alter pitch/speed without Stop/Start.
 

@@ -118,7 +118,6 @@ typedef struct host_api_v1 {
     int (*midi_inject_to_move)(const uint8_t *msg, int len);
     int (*slot_recv_channel)(void *instance);
     double (*get_beat_position)(void);
-    float (*get_project_bpm)(void);
 
 } host_api_v1_t;
 

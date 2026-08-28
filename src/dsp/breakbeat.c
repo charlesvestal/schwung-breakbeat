@@ -393,8 +393,8 @@ static void build_ui_hierarchy(const breakbeat_t *bb, char *out, int out_len) {
         "{\"key\":\"retrig_3x\",\"label\":\"Retrig 3x\",\"type\":\"int\",\"min\":0,\"max\":100},"
         "{\"key\":\"retrig_4x\",\"label\":\"Retrig 4x\",\"type\":\"int\",\"min\":0,\"max\":100},"
         "{\"key\":\"retrig_8x\",\"label\":\"Retrig 8x\",\"type\":\"int\",\"min\":0,\"max\":100},"
-        "{\"key\":\"save_preset\",\"label\":\"Save Preset\",\"type\":\"int\",\"min\":0,\"max\":1},"
-        "{\"key\":\"status\",\"label\":\"Status\",\"type\":\"enum\",\"options\":[\"-\"]}"
+        "{\"key\":\"save_preset\",\"label\":\"Save Preset\",\"type\":\"int\",\"min\":0,\"max\":1,\"access\":\"write\"},"
+        "{\"key\":\"status\",\"label\":\"Status\",\"type\":\"enum\",\"options\":[\"-\"],\"access\":\"read\"}"
         "]}}}",
         ar, br);
 }
@@ -420,8 +420,8 @@ static void build_chain_params(const breakbeat_t *bb, char *out, int out_len) {
         "{\"key\":\"retrig_3x\",\"name\":\"Retrig 3x\",\"type\":\"int\",\"min\":0,\"max\":100},"
         "{\"key\":\"retrig_4x\",\"name\":\"Retrig 4x\",\"type\":\"int\",\"min\":0,\"max\":100},"
         "{\"key\":\"retrig_8x\",\"name\":\"Retrig 8x\",\"type\":\"int\",\"min\":0,\"max\":100},"
-        "{\"key\":\"save_preset\",\"name\":\"Save Preset\",\"type\":\"int\",\"min\":0,\"max\":1},"
-        "{\"key\":\"status\",\"name\":\"Status\",\"type\":\"enum\",\"options\":[\"-\"]}"
+        "{\"key\":\"save_preset\",\"name\":\"Save Preset\",\"type\":\"int\",\"min\":0,\"max\":1,\"access\":\"write\"},"
+        "{\"key\":\"status\",\"name\":\"Status\",\"type\":\"enum\",\"options\":[\"-\"],\"access\":\"read\"}"
         "]",
         ar, br);
 }
@@ -1015,13 +1015,10 @@ static void* bb_create_instance(const char *module_dir, const char *json_default
     bb->dbg_last_heartbeat = 0;
     bb->rng_state = (uint32_t)time(NULL) ^ (uint32_t)(uintptr_t)bb;
 
-    /* Seed the stored tempo from the Set itself, never from a live clock
-     * estimate. The render path keeps this value current if the user changes
-     * the Move tempo after the module has been instantiated. */
-    if (g_host && g_host->get_project_bpm) {
-        float bpm = g_host->get_project_bpm();
-        if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
-    }
+    /* Seed the stored tempo. get_bpm() already resolves to the Set tempo when
+     * no clock is running -- its documented fallback chain is MIDI clock ->
+     * set tempo -> settings -> 120 -- and nothing is running at instantiation,
+     * so this is the Set's own tempo rather than a live estimate. */
     if (bb->stable_bpm < 20.0f && g_host && g_host->get_bpm) {
         float bpm = g_host->get_bpm();
         if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
@@ -1683,19 +1680,10 @@ static void bb_render_block(void *instance, int16_t *out_lr, int frames) {
      * completed its first clean measurement window. While running, prefer the
      * host's measured clock BPM so tempo-knob changes alter sample rate without
      * requiring Stop/Start (Move may defer writing Song.abl until Stop). */
-    if (g_host && g_host->get_project_bpm) {
-        float bpm = g_host->get_project_bpm();
-        if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
-        else if (bb->stable_bpm < 20.0f && g_host->get_bpm) {
-            /* A newly loaded Set may briefly have no published snapshot. Use
-             * the host's best tempo once, then retain the last valid value. */
-            bpm = g_host->get_bpm();
-            if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
-        }
-    } else if (g_host && g_host->get_bpm &&
-               (!running || bb->stable_bpm < 20.0f)) {
-        /* Compatibility only for older Schwung versions: never follow their
-         * live clock estimator continuously while audio is running. */
+    if (g_host && g_host->get_bpm && (!running || bb->stable_bpm < 20.0f)) {
+        /* Never follow the live clock estimator continuously while audio is
+         * running: take a tempo while stopped, or once if we have none yet,
+         * and retain the last valid value after that. */
         float bpm = g_host->get_bpm();
         if (bpm >= 20.0f && bpm <= 400.0f) bb->stable_bpm = bpm;
     }

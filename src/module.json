@@ -74,6 +74,7 @@
             },
             {
               "key": "B_chance",
+              "short_name": "Chance",
               "label": "B Chance",
               "type": "int",
               "min": 0,
@@ -159,6 +160,7 @@
             },
             {
               "key": "save_preset",
+              "short_name": "Preset",
               "label": "Save Preset",
               "type": "int",
               "min": 0,
